@@ -6,11 +6,17 @@
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <style>
     body{font-family:system-ui,Arial,sans-serif;max-width:820px;margin:24px auto;padding:0 12px}
-    #log{white-space:pre-wrap;border:1px solid #ddd;border-radius:12px;padding:12px;min-height:220px}
+    #log{border:1px solid #ddd;border-radius:12px;padding:12px;min-height:220px}
     .row{display:flex;gap:8px;align-items:flex-start;margin:10px 0}
     textarea{width:100%;padding:10px}
     button{padding:8px 14px}
     .tiny{font-size:12px;color:#666}
+    .line{white-space:pre-wrap;margin:2px 0}
+    .role{color:#555;font-weight:600;margin-right:6px}
+    .bot .role{color:#0b5}
+    .dbg{color:#888;font-style:italic}
+    .cursor{display:inline-block; width:6px; background:#bbb; animation:blink 1s step-end infinite}
+    @keyframes blink { 50% { background:transparent } }
   </style>
 </head>
 <body>
@@ -38,86 +44,123 @@
   const clearBtn = document.getElementById("clear");
   const streamBox = document.getElementById("stream");
 
-  // Simple client session id persisted locally
+  // --- session id ---
   const getSID = () => {
     let sid = localStorage.getItem("sid");
-    if (!sid) {
-      sid = (crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2));
-      localStorage.setItem("sid", sid);
-    }
+    if (!sid) { sid = (crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2));
+      localStorage.setItem("sid", sid); }
     return sid;
   };
 
-  const append = (role, text) => { log.textContent += `\n${role}: ${text}`; log.scrollTop = log.scrollHeight; };
+  // --- log helpers (single-line streaming) ---
+  const addLine = (cls, role, text="") => {
+    const line = document.createElement("div");
+    line.className = `line ${cls}`;
+    const r = document.createElement("span"); r.className = "role"; r.textContent = role + ":";
+    const m = document.createElement("span"); m.className = "msg"; m.textContent = " " + text;
+    line.appendChild(r); line.appendChild(m);
+    log.appendChild(line); log.scrollTop = log.scrollHeight;
+    return { line, msgSpan: m };
+  };
+  const addDbg = (text) => {
+    const line = document.createElement("div");
+    line.className = "line dbg"; line.textContent = `dbg: ${text}`;
+    log.appendChild(line); log.scrollTop = log.scrollHeight;
+  };
 
+  let live = null; // {line,msgSpan,cursor}
+  const startLiveBot = () => {
+    const { line, msgSpan } = addLine("bot", "Bot", "");
+    const cursor = document.createElement("span"); cursor.className = "cursor"; cursor.textContent = " ";
+    line.appendChild(cursor);
+    live = { line, msgSpan, cursor, buf: "" };
+  };
+  const pushLiveText = (t) => {
+    if (!live) startLiveBot();
+    live.buf += t;
+    live.msgSpan.textContent = " " + live.buf;
+    log.scrollTop = log.scrollHeight;
+  };
+  const endLive = () => {
+    if (!live) return;
+    live.line.removeChild(live.cursor);
+    live = null;
+  };
+
+  // --- UI buttons ---
   healthBtn.onclick = async () => {
-    try { const r = await fetch(`${API}/health`); append("Health",(await r.text()).trim()); }
-    catch(e){ append("Health", `[error] ${e?.message||e}`); }
+    try { const r = await fetch(`${API}/health`); addDbg(`health: ${(await r.text()).trim()}`); }
+    catch(e){ addDbg(`health error: ${e?.message||e}`); }
   };
   clearBtn.onclick = () => { log.textContent = ""; };
 
+  // --- send handler ---
   sendBtn.onclick = async () => {
     const text = (msgEl.value || "").trim();
     if (!text) return;
-    append("You", text);
+    addLine("", "You", text);
     msgEl.value = "";
 
     const useStream = !!(streamBox && streamBox.checked);
-
     if (!useStream) {
-      // Non-stream — server holds history; we pass SID header
       try {
         const r = await fetch(`${API}/chat`, {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "X-Session-Id": getSID(),
-          },
+          headers: {"Content-Type":"application/json", "X-Session-Id": getSID()},
           body: JSON.stringify({ message: text })
         });
         const j = await r.json();
         if (j?.sid) localStorage.setItem("sid", j.sid);
-        append("Bot", j?.response ?? "[no response]");
+        addLine("bot", "Bot", j?.response ?? "[no response]");
       } catch (e) {
-        append("Bot", `[network error] ${e?.message || e}`);
+        addLine("bot", "Bot", `[network error] ${e?.message || e}`);
       }
       return;
     }
 
-    // Stream via EventSource. Include SID in query (EventSource can't set headers).
-    try {
+    // --- streaming via EventSource with one-time retry ---
+    const tryStream = (attempt=1) => {
+      startLiveBot();
       const url = `${API}/chat_sse?q=${encodeURIComponent(text)}&sid=${encodeURIComponent(getSID())}`;
       const es = new EventSource(url, { withCredentials:false });
-      let opened=false, gotData=false;
+      let gotAny = false;
 
-      es.onopen = () => { opened = true; append("dbg","[sse opened]"); };
+      es.onopen = () => addDbg("[sse opened]");
       es.onmessage = (ev) => {
         if (!ev.data) return;
         try {
           const obj = JSON.parse(ev.data);
-          if (obj.text) { append("Bot", obj.text); gotData = true; }
-          else append("Bot", ev.data);
-        } catch {
-          append("Bot", ev.data);
-        }
+          if (obj.text) { pushLiveText(obj.text); gotAny = true; }
+          else pushLiveText(ev.data + "\n");
+        } catch { pushLiveText(ev.data + "\n"); }
       };
       es.addEventListener("done", (ev) => {
-        try { const j = ev.data ? JSON.parse(ev.data) : {}; if (j?.sid) localStorage.setItem("sid", j.sid); } catch {}
-        append("dbg","[done]");
-        es.close();
+        try { const j = ev.data ? JSON.parse(ev.data) : {};
+          if (j?.sid) localStorage.setItem("sid", j.sid); } catch {}
+        addDbg("[done]");
+        es.close(); endLive();
       });
-      es.addEventListener("ping", () => {});
-      es.onerror = () => { if (!gotData) append("Bot","[stream error]"); es.close(); };
-
-      setTimeout(()=>{ try{ es.close(); }catch{} }, 90000);
-    } catch (e) {
-      append("Bot", `[stream error] ${e?.message || e}`);
-    }
+      es.addEventListener("ping", () => { /* keep-alive */ });
+      es.onerror = () => {
+        es.close();
+        if (!gotAny && attempt === 1) {
+          addDbg("[sse retry]");
+          endLive(); // clean current row
+          setTimeout(()=>tryStream(2), 800);
+        } else {
+          addLine("bot", "Bot", "[stream error]");
+          endLive();
+        }
+      };
+      // Safety: close after 90s
+      setTimeout(()=>{ try{ es.close(); endLive(); }catch{} }, 90000);
+    };
+    tryStream();
   };
 
   // Warm backend
-  (async () => { try { await fetch(`${API}/health`, { mode: "no-cors" }); } catch {} })();
-  // Ctrl/Cmd+Enter to send
+  (async () => { try { await fetch(`${API}/health`, { mode:"no-cors" }); } catch {} })();
+  // Ctrl/Cmd+Enter
   msgEl.addEventListener("keydown", (e)=>{ if(e.key==="Enter" && (e.metaKey||e.ctrlKey)) sendBtn.onclick(); });
   </script>
 </body>
