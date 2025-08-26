@@ -15,7 +15,7 @@ except Exception:
     _HAS_OPENAI = False
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")  # << use gpt-5-mini
+MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # << use gpt-5-mini
 
 app = FastAPI()
 
