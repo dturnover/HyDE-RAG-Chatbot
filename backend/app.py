@@ -1,5 +1,5 @@
-# app.py — memory + rollup + streaming + Phase 6 RAG with forced single-verse quote
-import os, json, asyncio, uuid
+# app.py — memory + rollup + streaming (batched) + RAG with forced single-verse quote
+import os, json, asyncio, uuid, re
 from typing import Optional, List, Dict
 
 from fastapi import FastAPI, Request
@@ -17,7 +17,7 @@ except Exception:
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-# ---- RAG (Phase 6) ----
+# ---- RAG ----
 from rag import STORE, init_store
 
 # memory settings
@@ -41,11 +41,12 @@ app.add_middleware(
     max_age=600,
 )
 
-# ---- health ----
-@app.get("/health")
-def health(): return PlainTextResponse("OK")
+# ---- health/root ----
 @app.get("/")
 def root(): return PlainTextResponse("ok")
+
+@app.get("/health")
+def health(): return PlainTextResponse("OK")
 
 # ---- sessions ----
 class Session:
@@ -131,13 +132,12 @@ def build_retrieval_context(sources: List[Dict], max_chars: int = 1200) -> str:
     if not sources: return ""
     lines = ["RETRIEVED PASSAGES (quote verbatim with [CIT:id] before guidance):"]
     used = 0
-    for s in sources[:2]:  # keep small
+    for s in sources[:2]:
         head = f"- [{s['trad']}] [CIT:{s['id']}] {s.get('ref','')}".strip()
         txt = s["text"].strip().replace("\n"," ")
         chunk = f"{head}\n  {txt}"
         if used + len(chunk) > max_chars: break
-        lines.append(chunk)
-        used += len(chunk)
+        lines.append(chunk); used += len(chunk)
     return "\n".join(lines)
 
 # ---- /chat (non-stream) ----
@@ -201,7 +201,7 @@ def sse_event(name: str, data: dict | str = "") -> str:
             for ln in str(data).splitlines(): out += f"data: {ln}\n"
     return out + "\n"
 
-# ---- /chat_sse (stream) ----
+# ---- /chat_sse (stream, with batched flush) ----
 @app.api_route("/chat_sse", methods=["GET","POST"])
 async def chat_sse(request: Request, q: Optional[str] = None, sid: Optional[str] = None):
     header_sid = request.headers.get("x-session-id") or ""
@@ -249,7 +249,7 @@ async def chat_sse(request: Request, q: Optional[str] = None, sid: Optional[str]
         # dev stream
         if client is None:
             acc = ""
-            for tok in ["dev"," ","stream"," ","ok"]:
+            for tok in ["dev"," stream ","ok."]:
                 yield sse_data({"text": tok}); acc += tok
                 await asyncio.sleep(0.05)
             sess.history.append({"role":"assistant","content":acc})
@@ -258,16 +258,31 @@ async def chat_sse(request: Request, q: Optional[str] = None, sid: Optional[str]
             yield sse_event("done", {"sid": sid})
             return
 
-        # real model stream
+        # real model stream (BATCHED)
         stream = client.chat.completions.create(model=MODEL, messages=messages, temperature=0.4, stream=True)
-        acc = ""
+
+        buf = ""
+        def should_flush(s: str) -> bool:
+            # flush on sentence stop or chunk size
+            return bool(re.search(r"[.!?]\s$", s)) or len(s) >= 120
+
         for ev in stream:
             delta = ev.choices[0].delta.content or ""
-            if delta:
-                acc += delta
-                yield sse_data({"text": delta})
+            if not delta:
+                continue
+            buf += delta
+            if should_flush(buf):
+                yield sse_data({"text": buf})
+                buf = ""
                 await asyncio.sleep(0)
-        sess.history.append({"role":"assistant","content":acc})
+        if buf:
+            yield sse_data({"text": buf})
+
+        # finalize
+        # append the whole assistant turn (what the user saw)
+        # (front-end already appended chunks; we store joined)
+        # You could store the accumulator instead; here we signal done only.
+        sess.history.append({"role":"assistant","content":"(streamed response)"})
         trim_history(sess)
         if sources: yield sse_event("sources", {"sources": sources})
         yield sse_event("done", {"sid": sid})
