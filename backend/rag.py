@@ -1,11 +1,9 @@
 # rag.py — ultra-light vector search over JSONL (embeddings + text)
-import os, json, math
+import os, json
 from typing import List, Dict, Optional, Tuple
 import numpy as np
 
 EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
-
-# ---------- tiny loader ----------
 
 class VectorIndex:
     def __init__(self, name: str):
@@ -17,49 +15,49 @@ class VectorIndex:
         metas, vecs = [], []
         with open(path, "r", encoding="utf-8", errors="ignore") as f:
             for line in f:
-                if not line.strip(): continue
+                line = line.strip()
+                if not line: continue
                 obj = json.loads(line)
-                if "embedding" not in obj or "text" not in obj:  # skip malformed
+                emb = obj.get("embedding")
+                text = obj.get("text")
+                if emb is None or text is None:
                     continue
                 metas.append({
                     "id": obj.get("id", ""),
-                    "text": obj["text"],
+                    "text": text,
                     "ref": obj.get("ref") or obj.get("book") or "",
                     "source": obj.get("source", self.name),
                 })
-                vecs.append(obj["embedding"])
+                vecs.append(emb)
         if not vecs:
             self.meta, self.mat = [], None
             return 0
         self.meta = metas
         self.mat = np.asarray(vecs, dtype=np.float32)
-        # pre-normalize for cosine
         norms = np.linalg.norm(self.mat, axis=1, keepdims=True) + 1e-8
-        self.mat = self.mat / norms
+        self.mat = self.mat / norms  # pre-normalize for cosine
         return len(self.meta)
 
     def search(self, q_vec: np.ndarray, top_k: int = 5) -> List[Tuple[int, float]]:
         if self.mat is None or self.mat.size == 0: return []
-        # q_vec shape (D,)
         qn = q_vec / (np.linalg.norm(q_vec) + 1e-8)
-        sims = self.mat @ qn  # cosine similarity
-        idx = np.argpartition(-sims, min(top_k, sims.size-1))[:top_k]
+        sims = self.mat @ qn  # cosine
+        k = min(top_k, sims.size) if sims.size else 0
+        if k == 0: return []
+        idx = np.argpartition(-sims, k - 1)[:k]
         idx = idx[np.argsort(-sims[idx])]
         return [(int(i), float(sims[int(i)])) for i in idx]
 
-# ---------- global registry ----------
-
 class RAGStore:
     def __init__(self):
-        self.idxs: Dict[str, VectorIndex] = {}  # trad -> index
+        self.idxs: Dict[str, VectorIndex] = {}
 
     def load_all(self, base_dir: str):
-        # look for <trad>.jsonl in base_dir
         for trad in ["bible", "quran", "talmud"]:
             p1 = os.path.join(base_dir, f"{trad}.jsonl")
             p2 = os.path.join(os.path.dirname(__file__), f"{trad}.jsonl")
             path = p1 if os.path.exists(p1) else p2 if os.path.exists(p2) else None
-            if not path: 
+            if not path:
                 continue
             vi = VectorIndex(trad)
             n = vi.load_jsonl(path)
@@ -70,7 +68,8 @@ class RAGStore:
         return list(self.idxs.keys())
 
     def embed_query(self, client, text: str) -> Optional[np.ndarray]:
-        if client is None:  # dev fallback: random vector (deterministic-ish)
+        if client is None:
+            # DEV fallback: deterministic pseudo-vector
             rng = np.random.default_rng(abs(hash(text)) % (2**32))
             return rng.standard_normal(1536).astype(np.float32)
         emb = client.embeddings.create(model=EMBED_MODEL, input=text)
@@ -93,7 +92,6 @@ class RAGStore:
             if not idx: continue
             for i, s in idx.search(qv, top_k=top_k_each):
                 results.append((t, i, s))
-        # sort by score across all
         results.sort(key=lambda x: -x[2])
         out: List[Dict] = []
         seen = set()
@@ -113,10 +111,8 @@ class RAGStore:
             if len(out) >= limit: break
         return out
 
-# singleton
 STORE = RAGStore()
 
 def init_store():
     base = os.getenv("RAG_DIR", os.path.join(os.path.dirname(__file__), "indexes"))
-    # also accept plain files next to app.py if user used the quick builder
     STORE.load_all(base_dir=base)

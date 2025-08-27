@@ -1,5 +1,5 @@
-# app.py — memory + rollup + streaming + Phase 6 vector retrieval
-import os, json, asyncio, uuid, re
+# app.py — memory + rollup + streaming + Phase 6 RAG with forced single-verse quote
+import os, json, asyncio, uuid
 from typing import Optional, List, Dict
 
 from fastapi import FastAPI, Request
@@ -18,7 +18,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 # ---- RAG (Phase 6) ----
-from rag import STORE, init_store, EMBED_MODEL
+from rag import STORE, init_store
 
 # memory settings
 KEEP_TURNS = 20
@@ -55,8 +55,9 @@ class Session:
             "content":(
                 "You are Fight Chaplain: calm, concise, encouraging. "
                 "Offer practical corner-coach guidance with spiritual grounding. "
-                "Keep answers tight; avoid filler. When I provide RETRIEVED PASSAGES, "
-                "quote only from them if you choose to cite scripture and include the given citation tag."
+                "Keep answers tight; avoid filler. "
+                "When I provide RETRIEVED PASSAGES, you must quote at least one verbatim using the given [CIT:id] tag "
+                "before offering additional guidance."
             )
         }]
         self.memory_blob: str = ""
@@ -119,7 +120,7 @@ def rollup_if_needed(client, sess: Session):
     sess.history = [base] + recent
 
 # ---- RAG triggers ----
-EMO_WORDS = ["scared","afraid","anxious","nervous","panic","injury","hurt","grief","loss","fear","doubt","alone"]
+EMO_WORDS = ["scared","afraid","anxious","nervous","panic","injury","hurt","grief","loss","fear","doubt","alone","worry","worried","anxiety"]
 ASK_WORDS = ["verse","scripture","ayah","surah","psalm","quote","passage","talmud","tractate","bible","quran"]
 
 def wants_retrieval(msg: str) -> bool:
@@ -128,9 +129,9 @@ def wants_retrieval(msg: str) -> bool:
 
 def build_retrieval_context(sources: List[Dict], max_chars: int = 1200) -> str:
     if not sources: return ""
-    lines = ["RETRIEVED PASSAGES (use if relevant; cite with [CIT:<id>]):"]
+    lines = ["RETRIEVED PASSAGES (quote verbatim with [CIT:id] before guidance):"]
     used = 0
-    for s in sources[:2]:  # keep it tight
+    for s in sources[:2]:  # keep small
         head = f"- [{s['trad']}] [CIT:{s['id']}] {s.get('ref','')}".strip()
         txt = s["text"].strip().replace("\n"," ")
         chunk = f"{head}\n  {txt}"
@@ -139,7 +140,7 @@ def build_retrieval_context(sources: List[Dict], max_chars: int = 1200) -> str:
         used += len(chunk)
     return "\n".join(lines)
 
-# ---- endpoints ----
+# ---- /chat (non-stream) ----
 @app.post("/chat")
 async def chat(request: Request):
     try: body = await request.json()
@@ -155,20 +156,25 @@ async def chat(request: Request):
     rollup_if_needed(client, sess)
     trim_history(sess)
 
-    # optional retrieval
-    sources = []
+    sources: List[Dict] = []
+    messages: List[Dict[str,str]]
+
     if wants_retrieval(user_msg):
-        init_store()  # idempotent; fast after first load
-        sources = STORE.retrieve(client, query=user_msg, hint=user_msg, top_k_each=4, limit=6)
+        init_store()
+        sources = STORE.retrieve(client, query=user_msg, hint=user_msg, top_k_each=4, limit=3)
         if sources:
+            # Force inject ONE verbatim verse before guidance
+            top = sources[0]
+            verse_line = f"{top['text']} [CIT:{top['id']}]"
+            sess.history.append({"role":"assistant","content":verse_line})
+
             ctx = build_retrieval_context(sources)
-            if ctx:
-                # inject as system preface for THIS call only
-                sys_msg = _system_with_memory(sess)
-                sys_msg["content"] = sys_msg["content"] + "\n\n" + ctx
-                messages = [sys_msg] + sess.history[1:]
-            else:
-                messages = [_system_with_memory(sess)] + sess.history[1:]
+            sys_msg = _system_with_memory(sess)
+            sys_msg["content"] = sys_msg["content"] + (
+                "\n\nIf RETRIEVED PASSAGES are present, ALWAYS quote at least one verbatim "
+                "with the provided [CIT:id] tag before giving additional guidance.\n\n" + ctx
+            )
+            messages = [sys_msg] + sess.history[1:]
         else:
             messages = [_system_with_memory(sess)] + sess.history[1:]
     else:
@@ -185,6 +191,7 @@ async def chat(request: Request):
     trim_history(sess)
     return JSONResponse({"response": reply, "sid": sid, "sources": sources}, headers={"X-Session-Id": sid})
 
+# ---- SSE helpers ----
 def sse_data(obj) -> str: return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
 def sse_event(name: str, data: dict | str = "") -> str:
     out = f"event: {name}\n"
@@ -194,6 +201,7 @@ def sse_event(name: str, data: dict | str = "") -> str:
             for ln in str(data).splitlines(): out += f"data: {ln}\n"
     return out + "\n"
 
+# ---- /chat_sse (stream) ----
 @app.api_route("/chat_sse", methods=["GET","POST"])
 async def chat_sse(request: Request, q: Optional[str] = None, sid: Optional[str] = None):
     header_sid = request.headers.get("x-session-id") or ""
@@ -212,21 +220,29 @@ async def chat_sse(request: Request, q: Optional[str] = None, sid: Optional[str]
         yield ": connected\n\n"
         yield sse_event("ping", "hi")
 
-        # user turn + rollup
+        # user + rollup
         sess.history.append({"role":"user","content":user_msg})
         rollup_if_needed(client, sess)
         trim_history(sess)
 
-        # maybe retrieve
-        sources = []
+        sources: List[Dict] = []
         sys_msg = _system_with_memory(sess)
+
         if wants_retrieval(user_msg):
             init_store()
-            sources = STORE.retrieve(client, query=user_msg, hint=user_msg, top_k_each=4, limit=6)
+            sources = STORE.retrieve(client, query=user_msg, hint=user_msg, top_k_each=4, limit=3)
             if sources:
+                # Force inject ONE verbatim verse before guidance
+                top = sources[0]
+                verse_line = f"{top['text']} [CIT:{top['id']}]"
+                sess.history.append({"role":"assistant","content":verse_line})
+                trim_history(sess)
+
                 ctx = build_retrieval_context(sources)
-                if ctx:
-                    sys_msg = {"role":"system","content": sys_msg["content"] + "\n\n" + ctx}
+                sys_msg = {"role":"system","content": sys_msg["content"] + (
+                    "\n\nIf RETRIEVED PASSAGES are present, ALWAYS quote at least one verbatim "
+                    "with the provided [CIT:id] tag before giving additional guidance.\n\n" + ctx
+                )}
 
         messages = [sys_msg] + sess.history[1:]
 
@@ -242,7 +258,7 @@ async def chat_sse(request: Request, q: Optional[str] = None, sid: Optional[str]
             yield sse_event("done", {"sid": sid})
             return
 
-        # model stream
+        # real model stream
         stream = client.chat.completions.create(model=MODEL, messages=messages, temperature=0.4, stream=True)
         acc = ""
         for ev in stream:
@@ -259,7 +275,7 @@ async def chat_sse(request: Request, q: Optional[str] = None, sid: Optional[str]
     headers = {"Cache-Control": "no-cache","X-Accel-Buffering": "no","X-Session-Id": sid}
     return StreamingResponse(agen(), media_type="text/event-stream", headers=headers)
 
-# initialize vector store on boot (non-fatal if files missing)
+# init vector store on boot (non-fatal if files missing)
 try:
     init_store()
 except Exception:
