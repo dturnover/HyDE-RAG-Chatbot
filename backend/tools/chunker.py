@@ -1,11 +1,32 @@
 # chunker.py - split large texts into JSONL rows with stable ids/refs
-import sys, json, os, re
+import sys, json, os, re, textwrap
 from typing import Iterator, Dict
+
+MAX_CHARS = 1500  # safety cap per chunk
 
 def yield_paragraphs(text: str) -> Iterator[str]:
     for block in re.split(r"\n\s*\n", text):
         t = block.strip()
-        if t: yield t
+        if not t:
+            continue
+        if len(t) <= MAX_CHARS:
+            yield t
+        else:
+            # split long blocks by sentence-ish boundaries
+            parts = re.split(r'(?<=[.!?])\s+', t)
+            buf = ""
+            for p in parts:
+                if len(buf) + 1 + len(p) <= MAX_CHARS:
+                    buf = (buf + " " + p).strip()
+                else:
+                    if buf:
+                        yield buf
+                    # if a single sentence is still huge, hard-wrap it
+                    for w in textwrap.wrap(p, MAX_CHARS):
+                        yield w
+                    buf = ""
+            if buf:
+                yield buf
 
 def main(trad: str, inp: str, outp: str):
     with open(inp, "r", encoding="utf-8", errors="ignore") as f:
