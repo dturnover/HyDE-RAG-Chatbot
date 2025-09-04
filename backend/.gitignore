@@ -3,3 +3,5 @@ __pycache__/
 
 backend/.env
 .env
+backend/jsonl_raw/
+backend/jsonl_raw/
