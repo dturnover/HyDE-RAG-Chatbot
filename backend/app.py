@@ -233,17 +233,57 @@ def sse_event(event: Optional[str], data: str) -> str:
         return f"event: {event}\n" + "\n".join(f"data: {line}" for line in data.splitlines()) + "\n\n"
     return "\n".join(f"data: {line}" for line in data.splitlines()) + "\n\n"
 
-# ========= App + CORS =========
-app = FastAPI()
+# ---- CORS config (exact-origin echo) ----
+
+ALLOWED_ORIGINS = {
+    "https://dturnover.github.io",
+    "http://localhost:3000", "http://127.0.0.1:3000",
+    "http://localhost:5500", "http://127.0.0.1:5500",
+}
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=list(ALLOWED_ORIGINS),   # do NOT use ["*"] when credentials are used
     allow_credentials=True,
-    allow_methods=["GET","POST","OPTIONS"],
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
     expose_headers=["*"],
     max_age=600,
 )
+
+@app.middleware("http")
+async def cors_exact_origin(request: Request, call_next):
+    origin = request.headers.get("origin", "")
+    resp = await call_next(request)
+
+    if origin in ALLOWED_ORIGINS:
+        # Echo the exact Origin so the browser accepts cookies & SSE
+        resp.headers["Access-Control-Allow-Origin"] = origin
+        resp.headers["Vary"] = "Origin"
+        resp.headers["Access-Control-Allow-Credentials"] = "true"
+        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        # Mirror requested headers if present; otherwise allow all
+        req_hdrs = request.headers.get("access-control-request-headers")
+        resp.headers["Access-Control-Allow-Headers"] = req_hdrs or "*"
+        resp.headers["Access-Control-Expose-Headers"] = "*"
+    return resp
+
+# Handle preflight explicitly so every path returns 200 with proper headers
+@app.options("/{rest_of_path:path}")
+def options_preflight(request: Request, rest_of_path: str):
+    origin = request.headers.get("origin", "")
+    headers = {}
+    if origin in ALLOWED_ORIGINS:
+        headers = {
+            "Access-Control-Allow-Origin": origin,
+            "Vary": "Origin",
+            "Access-Control-Allow-Credentials": "true",
+            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+            "Access-Control-Allow-Headers": request.headers.get("access-control-request-headers") or "*",
+            "Access-Control-Max-Age": "600",
+        }
+    return PlainTextResponse("OK", headers=headers)
+
 
 # ========= Routes =========
 @app.get("/")
