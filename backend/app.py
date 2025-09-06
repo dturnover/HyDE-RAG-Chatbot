@@ -235,6 +235,8 @@ def sse_event(event: Optional[str], data: str) -> str:
 
 # ---- CORS config (exact-origin echo) ----
 
+app = FastAPI()
+
 ALLOWED_ORIGINS = {
     "https://dturnover.github.io",
     "http://localhost:3000", "http://127.0.0.1:3000",
