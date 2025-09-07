@@ -382,11 +382,19 @@ async def chat(request: Request):
 
 @app.get("/chat_sse")
 async def chat_sse(request: Request, q: str, sid: Optional[str] = None):
-    # attach incoming sid to request so our existing session code sees it
-    if sid:
-        request.headers.__dict__.setdefault("_list", []).append((b"x-session-id", sid.encode()))
-
     base = Response()
+
+    # SAFE session acquire; do NOT mutate request.headers
+    try:
+        if sid and sid in SESSIONS:
+            sid2, s = sid, SESSIONS[sid]
+        else:
+            sid2, s = get_or_create_sid(request, base)
+    except Exception:
+        # ultra-safe fallback: never 500 before stream starts
+        sid2, s = uuid.uuid4().hex, SessionState()
+        SESSIONS[sid2] = s
+
     sid2, s = get_or_create_sid(request, base)
     try_set_faith(q, s)
     corpus = detect_corpus(q, s)
