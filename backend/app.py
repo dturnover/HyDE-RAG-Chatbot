@@ -395,7 +395,6 @@ async def chat_sse(request: Request, q: str, sid: Optional[str] = None):
         sid2, s = uuid.uuid4().hex, SessionState()
         SESSIONS[sid2] = s
 
-    sid2, s = get_or_create_sid(request, base)
     try_set_faith(q, s)
     corpus = detect_corpus(q, s)
     origin = request.headers.get("origin")
@@ -407,8 +406,15 @@ async def chat_sse(request: Request, q: str, sid: Optional[str] = None):
             yield sse_event("ping", "hi")
 
             # emotional / verse ask → try RAG first
-            emotional = any(w in q.lower() for w in ["scared","afraid","anxious","nervous","panic","breakup","hurt","down","lost","depressed","angry","worried","fight","injury","pain","tired","exhausted","grateful"])
-            asks_scripture = any(w in q.lower() for w in ["verse","scripture","psalm","quote","recite","ayah","surah","mishnah","talmud","[cit"])
+            emotional = any(w in q.lower() for w in [
+                "scared","afraid","anxious","nervous","panic","breakup","hurt",
+                "down","lost","depressed","angry","worried","fight","injury",
+                "pain","tired","exhausted","grateful"
+            ])
+            asks_scripture = any(w in q.lower() for w in [
+                "verse","scripture","psalm","quote","recite","ayah","surah",
+                "mishnah","talmud","[cit"
+            ])
 
             rag_hit = None
             if emotional or asks_scripture:
@@ -452,8 +458,11 @@ async def chat_sse(request: Request, q: str, sid: Optional[str] = None):
             err = {"error": str(e)}
             yield sse_event("error", json.dumps(err))
 
-    # merge Set-Cookie from base response + explicit SSE/CORS headers
+    # merge Set-Cookie from base response + explicit SSE/CORS headers + proxy hints
     hdrs = {**dict(base.headers), **sse_headers_for_origin(origin)}
+    hdrs["Cache-Control"] = "no-cache"
+    hdrs["X-Accel-Buffering"] = "no"   # important for some proxies/CDNs
+
     return StreamingResponse(gen(), media_type="text/event-stream", headers=hdrs)
 
 
