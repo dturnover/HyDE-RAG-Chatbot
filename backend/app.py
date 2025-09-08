@@ -1,11 +1,11 @@
-# app.py — small FastAPI chat API with optional RAG (hybrid lexical+vector)
+# app.py — FastAPI chat API with optional RAG (hybrid lexical+vector)
 # Behavior:
 # - Normal chat by default (no citations).
 # - If the user clearly asks for a verse/scripture/quote, we run hybrid retrieval
-#   and return ONE relevant passage with [CIT:<ref>], then brief guidance.
+#   and return ONE relevant passage with [CIT: <ref>], then brief guidance.
 # - If there is no meaningful match, we skip RAG and just chat.
 
-import os, re, json, uuid, math, random, time
+import os, re, json, uuid, math
 from typing import Dict, List, Optional, Any, Tuple, Generator
 
 from fastapi import FastAPI, Request, Response
@@ -27,11 +27,16 @@ EMBED_MODEL    = os.getenv("EMBED_MODEL", "text-embedding-3-small")
 # ========= Session state (in-memory) =========
 class SessionState:
     def __init__(self) -> None:
-        self.history: List[Dict[str, str]] = [{"role":"system","content":(
-            "You are Fight Chaplain: calm, concise, and encouraging. "
-            "Offer practical corner-coach guidance with spiritual grounding. "
-            "Keep answers tight; avoid filler."
-        )}]
+        self.history: List[Dict[str, str]] = [{
+            "role":"system",
+            "content":(
+                "You are Fight Chaplain: calm, concise, and encouraging. "
+                "Offer practical corner-coach guidance with spiritual grounding. "
+                "Keep answers tight; avoid filler. "
+                "If RETRIEVED PASSAGES are provided, quote exactly one verbatim "
+                "using the [CIT:id] tag, then add brief guidance. Do not add extra verses."
+            )
+        }]
         self.rollup: Optional[str] = None
 
 SESSIONS: Dict[str, SessionState] = {}
@@ -50,20 +55,18 @@ from pathlib import Path
 def _candidate_index_dirs() -> List[Path]:
     here = Path(__file__).parent.resolve()
     env = os.getenv("RAG_DIR", "").strip()
-    cands = []
+    cands: List[Path] = []
     if env: cands.append(Path(env))
-    # common layouts:
     cands += [
         here / "indexes",
         here / "backend" / "indexes",
-        Path("/opt/render/project/src/indexes"),  # Render default checkout path
+        Path("/opt/render/project/src/indexes"),  # Render
     ]
-    # dedupe while preserving order
-    uniq = []
-    seen = set()
+    seen, uniq = set(), []
     for p in cands:
         if p not in seen:
-            uniq.append(p); seen.add(p)
+            uniq.append(p)
+            seen.add(p)
     return uniq
 
 def load_jsonl(path: Path) -> List[Dict[str, Any]]:
@@ -144,32 +147,49 @@ def embed_query(text: str) -> Optional[List[float]]:
 def call_openai(messages: List[Dict[str,str]], stream: bool):
     cli = oa_client()
     if not cli:
-        # dev echo
         if stream:
             def _g():
                 for w in "Dev mode: OpenAI disabled on server.".split():
                     yield w + " "
             return _g()
-        else:
-            return "⚠️ OpenAI disabled on server; running in dev mode."
+        return "⚠️ OpenAI disabled on server; running in dev mode."
     if stream:
-        resp = cli.chat.completions.create(model=OPENAI_MODEL, messages=messages, temperature=0.4, stream=True)
+        resp = cli.chat.completions.create(
+            model=OPENAI_MODEL, messages=messages, temperature=0.4, stream=True
+        )
         def _gen():
             for ev in resp:
-                piece = ev.choices[0].delta.content or ""
-                if piece: yield piece
+                # SDK 1.10x: text lives in choices[0].delta.content
+                piece = ""
+                try:
+                    piece = ev.choices[0].delta.content or ""
+                except Exception:
+                    piece = ""
+                if piece:
+                    yield piece
         return _gen()
     else:
-        resp = cli.chat.completions.create(model=OPENAI_MODEL, messages=messages, temperature=0.4)
+        resp = cli.chat.completions.create(
+            model=OPENAI_MODEL, messages=messages, temperature=0.4
+        )
         return resp.choices[0].message.content or ""
 
 # ========= RAG trigger (only when clearly asked) =========
-ASK_WORDS = ["verse","scripture","psalm","quote","passage","ayah","surah","quran","bible","talmud","tractate"]
+ASK_WORDS = [
+    "verse","scripture","psalm","quote","passage","ayah","surah",
+    "quran","bible","talmud","tractate"
+]
 def wants_retrieval(msg: str) -> bool:
     m = f" {msg.lower()} "
     if any(f" {w} " in m for w in ASK_WORDS): return True
     if "give me a verse" in m or "share a verse" in m or "quote from" in m: return True
     return False
+
+def detect_corpus(msg: str) -> str:
+    m = msg.lower()
+    if any(w in m for w in ["quran","surah","ayah"]): return "quran"
+    if any(w in m for w in ["talmud","tractate","mishnah","gemara"]): return "talmud"
+    return "bible"
 
 # ========= Hybrid search (lexical + vector) with “no signal → skip” =========
 def hybrid_search(query: str, corpus_name: str, top_k: int = 6) -> List[Dict[str,Any]]:
@@ -225,16 +245,15 @@ def attach_citation(text: str, hit: Optional[Dict[str,Any]]) -> str:
     if not hit: return text
     ref = (hit.get("ref") or "").strip()
     if not ref: return text
-    return f'{text} [CIT: {ref}]'
+    return f"{text.strip()} [CIT: {ref}]"
 
-# ========= SSE helper =========
+# ========= SSE helpers =========
 def sse_event(event: Optional[str], data: str) -> str:
     if event:
         return f"event: {event}\n" + "\n".join(f"data: {line}" for line in data.splitlines()) + "\n\n"
     return "\n".join(f"data: {line}" for line in data.splitlines()) + "\n\n"
 
 def sse_headers_for_origin(origin: str | None) -> dict[str, str]:
-    # mirror our CORS policy for SSE responses
     h = {
         "Cache-Control": "no-cache",
         "Connection": "keep-alive",
@@ -247,7 +266,6 @@ def sse_headers_for_origin(origin: str | None) -> dict[str, str]:
     return h
 
 # ---- CORS config (exact-origin echo) ----
-
 app = FastAPI()
 
 ALLOWED_ORIGINS = {
@@ -258,7 +276,7 @@ ALLOWED_ORIGINS = {
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=list(ALLOWED_ORIGINS),   # do NOT use ["*"] when credentials are used
+    allow_origins=list(ALLOWED_ORIGINS),   # credentials safe
     allow_credentials=True,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
@@ -270,20 +288,16 @@ app.add_middleware(
 async def cors_exact_origin(request: Request, call_next):
     origin = request.headers.get("origin", "")
     resp = await call_next(request)
-
     if origin in ALLOWED_ORIGINS:
-        # Echo the exact Origin so the browser accepts cookies & SSE
         resp.headers["Access-Control-Allow-Origin"] = origin
         resp.headers["Vary"] = "Origin"
         resp.headers["Access-Control-Allow-Credentials"] = "true"
         resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-        # Mirror requested headers if present; otherwise allow all
         req_hdrs = request.headers.get("access-control-request-headers")
         resp.headers["Access-Control-Allow-Headers"] = req_hdrs or "*"
         resp.headers["Access-Control-Expose-Headers"] = "*"
     return resp
 
-# Handle preflight explicitly so every path returns 200 with proper headers
 @app.options("/{rest_of_path:path}")
 def options_preflight(request: Request, rest_of_path: str):
     origin = request.headers.get("origin", "")
@@ -298,7 +312,6 @@ def options_preflight(request: Request, rest_of_path: str):
             "Access-Control-Max-Age": "600",
         }
     return PlainTextResponse("OK", headers=headers)
-
 
 # ========= Routes =========
 @app.get("/")
@@ -338,25 +351,17 @@ async def chat(request: Request):
     if len(s.history) > 40:
         s.history = s.history[:1] + s.history[-39:]
 
-    use_rag = wants_retrieval(message)
     sources: List[Dict[str,Any]] = []
-
-    if use_rag:
-        # pick corpus by hinting from message (super simple)
-        hint = message.lower()
-        if "quran" in hint or "surah" in hint or "ayah" in hint:
-            corp = "quran"
-        elif "talmud" in hint or "tractate" in hint or "mishnah" in hint or "gemara" in hint:
-            corp = "talmud"
-        else:
-            corp = "bible"
+    if wants_retrieval(message):
+        corp = detect_corpus(message)
         hits = hybrid_search(message, corp, top_k=6)
         if hits:
             top = hits[0]
             verse = attach_citation(top.get("text",""), top)
-            # return the verse + brief guidance via model
+            # system nudge: exactly one quoted verse
             ctx = (
-                "RETRIEVED PASSAGES (quote at most one verbatim with [CIT:id], then add brief guidance):\n"
+                "RETRIEVED PASSAGES (quote exactly one verbatim with [CIT:id], "
+                "then add brief guidance):\n"
                 f"- [{corp}] [CIT:{top.get('ref','')}] {top.get('text','').strip().replace('\n',' ')}"
             )
             sys_msg = _sys_with_rollup(s)
@@ -364,14 +369,15 @@ async def chat(request: Request):
             messages = [sys_msg] + s.history[1:]
             out = call_openai(messages, stream=False)
             reply = out if isinstance(out, str) else "".join(list(out))
-            # ensure at least the verse is present
+            # ensure at least the verse appears once
             if verse not in reply:
                 reply = verse + "\n\n" + reply
+            # strip accidental second verses heuristically
+            reply = re.sub(r"\[CIT:\s*[^]]+\](?s:.*)\[CIT:\s*[^]]+\]", lambda m: m.group(0).split("[CIT:")[0].strip() + " [CIT:" + m.group(0).split("[CIT:",1)[1].split("]",1)[0] + "]", reply, count=1)
             s.history.append({"role":"assistant","content":reply})
             _maybe_rollup(s)
             return JSONResponse({"response": reply, "sid": sid,
                                  "sources":[{"ref": top.get("ref",""), "source": top.get("source","")}]})
-        # fallthrough to normal chat if no match
 
     # normal chat
     out = call_openai([_sys_with_rollup(s)] + s.history[1:], stream=False)
@@ -395,55 +401,57 @@ async def chat_sse(request: Request, q: str, sid: Optional[str] = None):
         sid2, s = uuid.uuid4().hex, SessionState()
         SESSIONS[sid2] = s
 
-    try_set_faith(q, s)
-    corpus = detect_corpus(q, s)
     origin = request.headers.get("origin")
 
     def gen() -> Generator[str, None, None]:
-        # ALWAYS yield something immediately so no Content-Length: 0
         try:
+            # ALWAYS yield something immediately so no Content-Length: 0
             yield ": connected\n\n"
-            yield sse_event("ping", "hi")
+            yield "event: ping\ndata: hi\n\n"
 
-            # emotional / verse ask → try RAG first
-            emotional = any(w in q.lower() for w in [
+            # emotional / explicit ask → try RAG first
+            m = q.lower()
+            emotional = any(w in m for w in [
                 "scared","afraid","anxious","nervous","panic","breakup","hurt",
                 "down","lost","depressed","angry","worried","fight","injury",
                 "pain","tired","exhausted","grateful"
             ])
-            asks_scripture = any(w in q.lower() for w in [
+            asks_scripture = any(w in m for w in [
                 "verse","scripture","psalm","quote","recite","ayah","surah",
-                "mishnah","talmud","[cit"
+                "mishnah","talmud","[cit:"
             ])
 
-            rag_hit = None
             if emotional or asks_scripture:
-                hits = hybrid_search(q, corpus, top_k=8)
-                rag_hit = choose_best_unique(s, hits)
-
-            if rag_hit:
-                text = attach_citation(rag_hit.get("text",""), rag_hit)
-                # chunk it out at sentence-ish boundaries
-                buf = ""
-                for token in text.split():
-                    buf += token + " "
-                    if len(buf) >= 160 or token.endswith((".", "!", "?")):
+                corp = detect_corpus(q)
+                hits = hybrid_search(q, corp, top_k=6)
+                if hits:
+                    top = hits[0]
+                    text = attach_citation(top.get("text",""), top)
+                    # stream the single verse in chunks
+                    buf = ""
+                    for token in text.split():
+                        buf += token + " "
+                        if re.search(r"[.!?]\s+$", buf) or len(buf) >= 160:
+                            yield f"data: {json.dumps({'text': buf.strip()})}\n\n"
+                            buf = ""
+                    if buf:
                         yield f"data: {json.dumps({'text': buf.strip()})}\n\n"
-                        buf = ""
-                if buf:
-                    yield f"data: {json.dumps({'text': buf.strip()})}\n\n"
-                s.history.append({"role":"user","content":q})
-                s.history.append({"role":"assistant","content":text})
-                maybe_rollup(s)
-                yield sse_event("done", json.dumps({"sid": sid2}))
-                return
+                    s.history.append({"role":"user","content":q})
+                    s.history.append({"role":"assistant","content":text})
+                    _maybe_rollup(s)
+                    yield f"event: done\ndata: {json.dumps({'sid': sid2})}\n\n"
+                    return
 
             # normal model stream
-            stream = call_openai([_sys_with_rollup(s)] + s.history[1:] + [{"role":"user","content":q}], stream=True)  # type: ignore
+            stream = call_openai(
+                [_sys_with_rollup(s)] + s.history[1:] + [{"role":"user","content":q}],
+                stream=True
+            )  # type: ignore
+
             buf = ""
             for piece in stream:
                 buf += piece
-                if re.search(r"[.!?]\s+$", buf) or len(buf) >= 160:
+                if re.search(r"[.!?]\s+$", buf) or len(buf) >= 200:
                     yield f"data: {json.dumps({'text': buf.strip()})}\n\n"
                     buf = ""
             if buf:
@@ -451,26 +459,21 @@ async def chat_sse(request: Request, q: str, sid: Optional[str] = None):
 
             s.history.append({"role":"user","content":q})
             s.history.append({"role":"assistant","content":""})
-            maybe_rollup(s)
-            yield sse_event("done", json.dumps({"sid": sid2}))
+            _maybe_rollup(s)
+            yield f"event: done\ndata: {json.dumps({'sid': sid2})}\n\n"
+
         except Exception as e:
             # Surface the error to the client instead of silent close
-            err = {"error": str(e)}
-            yield sse_event("error", json.dumps(err))
+            yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
 
     # merge Set-Cookie from base response + explicit SSE/CORS headers + proxy hints
     hdrs = {**dict(base.headers), **sse_headers_for_origin(origin)}
-    hdrs["Cache-Control"] = "no-cache"
-    hdrs["X-Accel-Buffering"] = "no"   # important for some proxies/CDNs
-
     return StreamingResponse(gen(), media_type="text/event-stream", headers=hdrs)
-
 
 # Keep GET stream “waker” for Render
 @app.get("/chat_sse_get")
 def chat_sse_get():
     def gen():
         yield ": connected\n\n"
-        for t in ["This is a GET stream endpoint.\n"]:
-            yield sse_event(None, t)
+        yield "data: This is a GET stream endpoint.\n\n"
     return StreamingResponse(gen(), media_type="text/event-stream")
