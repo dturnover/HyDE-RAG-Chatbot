@@ -6,7 +6,7 @@
 # - Only ONE verbatim passage is quoted with [CIT: ref] before guidance.
 # - SSE streams immediately with heartbeats and proxy headers.
 
-import os, re, json, uuid, math
+import os, re, json, uuid, math, asyncio
 from typing import Dict, List, Optional, Any, Tuple, Generator
 from pathlib import Path
 
@@ -395,65 +395,104 @@ async def chat_sse(request: Request, q: str, sid: Optional[str] = None):
         sid2, s = uuid.uuid4().hex, SessionState()
         SESSIONS[sid2] = s
 
+    # update faith memory now, before any retrieval
     try_set_faith(q, s)
     origin = request.headers.get("origin")
 
-    def gen() -> Generator[str, None, None]:
-        # immediate open (avoid 200 with empty body)
-        yield ": connected\n\n"
-        yield "event: ping\ndata: hi\n\n"
+    async def agen():
+        # Always send something immediately so the connection isn't 200/empty
+        yield b": connected\n\n"
+        yield b"event: ping\ndata: hi\n\n"
+
+        last_hb = asyncio.get_event_loop().time()
+
+        def chunk_emit(txt: str):
+            # one data frame
+            return ("data: " + json.dumps({"text": txt}) + "\n\n").encode("utf-8")
 
         try:
+            # RAG branch first if trigger fires
             if wants_retrieval(q):
                 corp = detect_corpus(q, s)
                 hits = hybrid_search(q, corp, top_k=6)
                 if hits:
                     top = hits[0]
                     text = attach_citation(top.get("text",""), top)
+
+                    # emit in sentence-ish chunks
                     buf = ""
                     for tok in text.split():
                         buf += tok + " "
                         if re.search(r"[.!?]\s+$", buf) or len(buf) >= 240:
-                            yield f"data: {json.dumps({'text': buf.strip()})}\n\n"
+                            yield chunk_emit(buf.strip())
                             buf = ""
+                            # heartbeat if needed
+                            now = asyncio.get_event_loop().time()
+                            if now - last_hb > 10:
+                                yield b": hb\n\n"
+                                last_hb = now
+                            await asyncio.sleep(0)  # cooperative yield
                     if buf:
-                        yield f"data: {json.dumps({'text': buf.strip()})}\n\n"
+                        yield chunk_emit(buf.strip())
+
+                    # persist turn and end
                     s.history.append({"role":"user","content":q})
                     s.history.append({"role":"assistant","content":text})
                     _maybe_rollup(s)
-                    yield f"event: done\ndata: {json.dumps({'sid': sid2})}\n\n"
+                    yield ("event: done\ndata: " + json.dumps({"sid": sid2}) + "\n\n").encode("utf-8")
                     return
 
-            # model stream
-            stream = call_openai([_sys_with_rollup(s)] + s.history[1:] + [{"role":"user","content":q}], stream=True)  # type: ignore
+            # Model streaming path
+            stream = call_openai(
+                [_sys_with_rollup(s)] + s.history[1:] + [{"role":"user","content":q}],
+                stream=True
+            )
+
+            # If dev mode returns a plain generator of words:
             buf = ""
-            since_hb = 0
-            for piece in stream:
+            for piece in stream:  # type: ignore
                 buf += piece
+                # flush on sentence end or every ~240 chars
                 if re.search(r"[.!?]\s+$", buf) or len(buf) >= 240:
-                    yield f"data: {json.dumps({'text': buf.strip()})}\n\n"
+                    yield chunk_emit(buf.strip())
                     buf = ""
-                    since_hb = 0
-                else:
-                    since_hb += len(piece)
-                if since_hb > 1000:
-                    yield ": hb\n\n"
-                    since_hb = 0
+                    now = asyncio.get_event_loop().time()
+                    if now - last_hb > 10:
+                        yield b": hb\n\n"
+                        last_hb = now
+                await asyncio.sleep(0)  # cooperative yield
+
             if buf:
-                yield f"data: {json.dumps({'text': buf.strip()})}\n\n"
+                yield chunk_emit(buf.strip())
 
             s.history.append({"role":"user","content":q})
             s.history.append({"role":"assistant","content":""})
             _maybe_rollup(s)
-            yield f"event: done\ndata: {json.dumps({'sid': sid2})}\n\n"
+            yield ("event: done\ndata: " + json.dumps({"sid": sid2}) + "\n\n").encode("utf-8")
 
         except Exception as e:
-            yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
+            # Don’t drop the socket empty—tell the client why
+            err = {"error": str(e)}
+            yield ("event: error\ndata: " + json.dumps(err) + "\n\n").encode("utf-8")
+            # soft landing so browsers don’t treat it as a network failure
+            yield b": end\n\n"
 
-    headers = {**dict(base.headers), **sse_headers_for_origin(origin)}
-    headers["Cache-Control"] = "no-cache"
-    headers["X-Accel-Buffering"] = "no"
-    return StreamingResponse(gen(), media_type="text/event-stream", headers=headers)
+    # headers: merge cookie + SSE/CORS + proxy hints
+    hdrs = {**dict(base.headers), **sse_headers_for_origin(origin)}
+    hdrs["Cache-Control"] = "no-cache"
+    hdrs["X-Accel-Buffering"] = "no"
+
+    return StreamingResponse(agen(), media_type="text/event-stream", headers=hdrs)
+
+@app.get("/sse_test")
+async def sse_test():
+    async def agen():
+        yield b": connected\n\n"
+        for i in range(1, 6):
+            await asyncio.sleep(0.4)
+            yield f"data: tick {i}\n\n".encode("utf-8")
+        yield b"event: done\ndata: ok\n\n"
+    return StreamingResponse(agen(), media_type="text/event-stream")
 
 # Minimal GET streamer to keep platforms happy
 @app.get("/chat_sse_get")
