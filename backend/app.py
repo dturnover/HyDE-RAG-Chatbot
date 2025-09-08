@@ -1,9 +1,11 @@
-# app.py — FastAPI chat API with optional RAG (hybrid lexical+vector)
+# app.py — FastAPI chat API with optional hybrid RAG + robust SSE
 # Behavior:
 # - Normal chat by default (no citations).
-# - If the user clearly asks for a verse/scripture/quote, we run hybrid retrieval
-#   and return ONE relevant passage with [CIT: <ref>], then brief guidance.
-# - If there is no meaningful match, we skip RAG and just chat.
+# - RAG triggers when the user explicitly asks for scripture/verse/quote
+#   OR when an emotional cue is detected (quick path).
+# - Retrieval uses hybrid lexical + vector scoring. If there is no signal,
+#   we skip RAG and just chat.
+# - Streaming (SSE) yields bytes immediately to avoid CL:0 / proxy buffering.
 
 import os, re, json, uuid, math
 from typing import Dict, List, Optional, Any, Tuple, Generator
@@ -12,7 +14,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-# ---- OpenAI (>=1.0) ----
+# ---------- OpenAI (>=1.0) ----------
 try:
     from openai import OpenAI
     _HAS_OPENAI = True
@@ -24,17 +26,14 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-4o-mini") or "gpt-4o-mini"
 EMBED_MODEL    = os.getenv("EMBED_MODEL", "text-embedding-3-small")
 
-# ========= Session state (in-memory) =========
+# ---------- Session state ----------
 class SessionState:
     def __init__(self) -> None:
         self.history: List[Dict[str, str]] = [{
-            "role":"system",
-            "content":(
-                "You are Fight Chaplain: calm, concise, and encouraging. "
+            "role":"system","content":(
+                "You are Fight Chaplain: calm, concise, encouraging. "
                 "Offer practical corner-coach guidance with spiritual grounding. "
-                "Keep answers tight; avoid filler. "
-                "If RETRIEVED PASSAGES are provided, quote exactly one verbatim "
-                "using the [CIT:id] tag, then add brief guidance. Do not add extra verses."
+                "Keep answers tight; avoid filler."
             )
         }]
         self.rollup: Optional[str] = None
@@ -50,8 +49,9 @@ def get_or_create_sid(request: Request, response: Response) -> Tuple[str, Sessio
         SESSIONS[sid] = SessionState()
     return sid, SESSIONS[sid]
 
-# ========= Index loading =========
+# ---------- Index loading ----------
 from pathlib import Path
+
 def _candidate_index_dirs() -> List[Path]:
     here = Path(__file__).parent.resolve()
     env = os.getenv("RAG_DIR", "").strip()
@@ -60,46 +60,45 @@ def _candidate_index_dirs() -> List[Path]:
     cands += [
         here / "indexes",
         here / "backend" / "indexes",
-        Path("/opt/render/project/src/indexes"),  # Render
+        Path("/opt/render/project/src/indexes"),
     ]
     seen, uniq = set(), []
     for p in cands:
         if p not in seen:
-            uniq.append(p)
-            seen.add(p)
+            uniq.append(p); seen.add(p)
     return uniq
 
 def load_jsonl(path: Path) -> List[Dict[str, Any]]:
-    rows: List[Dict[str, Any]] = []
-    if not path.exists(): return rows
+    out: List[Dict[str, Any]] = []
+    if not path.exists(): return out
     with path.open("r", encoding="utf-8", errors="ignore") as f:
         for line in f:
             line = line.strip()
             if not line: continue
             try:
                 obj = json.loads(line)
-                t = obj.get("text"); e = obj.get("embedding")
-                if t is None or e is None: continue
-                rows.append({
+                text = obj.get("text"); emb = obj.get("embedding")
+                if text is None or emb is None: continue
+                out.append({
                     "id": obj.get("id") or obj.get("ref") or "",
                     "ref": obj.get("ref") or obj.get("book") or obj.get("id") or "",
                     "source": obj.get("source") or "",
-                    "text": t,
-                    "embedding": e,
+                    "text": text,
+                    "embedding": emb,
                 })
             except Exception:
                 continue
-    return rows
+    return out
 
 def find_and_load_corpora() -> Dict[str, List[Dict[str, Any]]]:
-    files = ("bible.jsonl", "quran.jsonl", "talmud.jsonl")
+    names = ("bible.jsonl", "quran.jsonl", "talmud.jsonl")
     corpora: Dict[str, List[Dict[str, Any]]] = {"bible": [], "quran": [], "talmud": []}
     for base in _candidate_index_dirs():
-        for name in files:
-            p = base / name
+        for nm in names:
+            p = base / nm
             if p.exists() and p.stat().st_size > 0:
-                key = name.split(".")[0]
-                if not corpora[key]:  # first win
+                key = nm.split(".")[0]
+                if not corpora[key]:
                     corpora[key] = load_jsonl(p)
     return corpora
 
@@ -108,7 +107,7 @@ CORPORA: Dict[str, List[Dict[str, Any]]] = find_and_load_corpora()
 def corpus_counts() -> Dict[str,int]:
     return {k: len(v) for k,v in CORPORA.items()}
 
-# ========= Tiny text/metric helpers =========
+# ---------- Tiny text/metric helpers ----------
 _token = re.compile(r"[A-Za-z0-9]+")
 
 def tokenize(s: str) -> List[str]:
@@ -124,12 +123,12 @@ def cos(a: List[float], b: List[float]) -> float:
     s = 0.0; na = 0.0; nb = 0.0
     n = min(len(a), len(b))
     for i in range(n):
-        x = a[i]; y = b[i]
+        x, y = a[i], b[i]
         s += x*y; na += x*x; nb += y*y
     if na == 0 or nb == 0: return 0.0
     return s / math.sqrt(na*nb)
 
-# ========= OpenAI wrappers =========
+# ---------- OpenAI wrappers ----------
 def oa_client() -> Optional[OpenAI]:
     if not (_HAS_OPENAI and OPENAI_API_KEY):
         return None
@@ -152,36 +151,27 @@ def call_openai(messages: List[Dict[str,str]], stream: bool):
                 for w in "Dev mode: OpenAI disabled on server.".split():
                     yield w + " "
             return _g()
-        return "⚠️ OpenAI disabled on server; running in dev mode."
+        else:
+            return "⚠️ OpenAI disabled on server; running in dev mode."
     if stream:
-        resp = cli.chat.completions.create(
-            model=OPENAI_MODEL, messages=messages, temperature=0.4, stream=True
-        )
+        resp = cli.chat.completions.create(model=OPENAI_MODEL, messages=messages, temperature=0.4, stream=True)
         def _gen():
             for ev in resp:
-                # SDK 1.10x: text lives in choices[0].delta.content
-                piece = ""
-                try:
-                    piece = ev.choices[0].delta.content or ""
-                except Exception:
-                    piece = ""
-                if piece:
-                    yield piece
+                piece = ev.choices[0].delta.content or ""
+                if piece: yield piece
         return _gen()
     else:
-        resp = cli.chat.completions.create(
-            model=OPENAI_MODEL, messages=messages, temperature=0.4
-        )
+        resp = cli.chat.completions.create(model=OPENAI_MODEL, messages=messages, temperature=0.4)
         return resp.choices[0].message.content or ""
 
-# ========= RAG trigger (only when clearly asked) =========
-ASK_WORDS = [
-    "verse","scripture","psalm","quote","passage","ayah","surah",
-    "quran","bible","talmud","tractate"
-]
+# ---------- Retrieval trigger + corpus detection ----------
+ASK_WORDS = ["verse","scripture","psalm","quote","passage","ayah","surah","quran","bible","talmud","tractate"]
+EMO_WORDS = ["scared","afraid","anxious","nervous","panic","hurt","down","lost","depressed","angry","worried","fight","injury","pain","tired","exhausted","grateful"]
+
 def wants_retrieval(msg: str) -> bool:
     m = f" {msg.lower()} "
     if any(f" {w} " in m for w in ASK_WORDS): return True
+    if any(f" {w} " in m for w in EMO_WORDS): return True
     if "give me a verse" in m or "share a verse" in m or "quote from" in m: return True
     return False
 
@@ -191,7 +181,7 @@ def detect_corpus(msg: str) -> str:
     if any(w in m for w in ["talmud","tractate","mishnah","gemara"]): return "talmud"
     return "bible"
 
-# ========= Hybrid search (lexical + vector) with “no signal → skip” =========
+# ---------- Hybrid search ----------
 def hybrid_search(query: str, corpus_name: str, top_k: int = 6) -> List[Dict[str,Any]]:
     docs = CORPORA.get(corpus_name, [])
     if not docs: return []
@@ -199,34 +189,30 @@ def hybrid_search(query: str, corpus_name: str, top_k: int = 6) -> List[Dict[str
     q_tokens = set(tokenize(query))
 
     # lexical
-    lex_scores: List[Tuple[float,int]] = []
     any_lex = False
+    lex_scores: List[Tuple[float,int]] = []
     for i, d in enumerate(docs):
         t = d.get("text","")
-        if not t:
-            lex_scores.append((0.0, i)); continue
-        js = jaccard(q_tokens, set(tokenize(t)))
+        js = jaccard(q_tokens, set(tokenize(t))) if t else 0.0
         if js > 0.0: any_lex = True
         lex_scores.append((js, i))
 
     # vector
     q_emb = embed_query(query)
-    vec_scores: List[Tuple[float,int]] = []
     any_vec = False
     if q_emb:
+        vec_scores = []
         for i, d in enumerate(docs):
             e = d.get("embedding")
             s = cos(q_emb, e) if isinstance(e, list) else 0.0
-            if s > 0.05: any_vec = True   # tiny positive signal
+            if s > 0.05: any_vec = True
             vec_scores.append((s, i))
     else:
         vec_scores = [(0.0, i) for i in range(len(docs))]
 
-    # No lexical match and no vector signal → skip RAG
     if not any_lex and not any_vec:
         return []
 
-    # z-score normalize & blend
     def zscore(lst: List[Tuple[float,int]]) -> Dict[int,float]:
         vals = [x for x,_ in lst]
         if not vals: return {}
@@ -238,34 +224,40 @@ def hybrid_search(query: str, corpus_name: str, top_k: int = 6) -> List[Dict[str
     alpha = 0.6
     blended = [(alpha*L.get(i,0.0) + (1-alpha)*V.get(i,0.0), i) for i in range(len(docs))]
     blended.sort(reverse=True)
-    out = [docs[i] for _, i in blended[:top_k]]
-    return out
+    return [docs[i] for _, i in blended[:top_k]]
+
+# ---------- Citation helpers ----------
+CIT_RE = re.compile(r"\[CIT:\s*[^]]+\]")
 
 def attach_citation(text: str, hit: Optional[Dict[str,Any]]) -> str:
     if not hit: return text
     ref = (hit.get("ref") or "").strip()
     if not ref: return text
-    return f"{text.strip()} [CIT: {ref}]"
+    return f"{text} [CIT: {ref}]"
 
-# ========= SSE helpers =========
-def sse_event(event: Optional[str], data: str) -> str:
-    if event:
-        return f"event: {event}\n" + "\n".join(f"data: {line}" for line in data.splitlines()) + "\n\n"
-    return "\n".join(f"data: {line}" for line in data.splitlines()) + "\n\n"
+def keep_one_citation(text: str) -> str:
+    """Keep the first [CIT: …] and remove any later ones; normalize spacing."""
+    m = CIT_RE.search(text)
+    if not m:
+        return text
+    head = text[:m.end()]
+    tail = CIT_RE.sub("", text[m.end():])
+    return re.sub(r"\s{2,}", " ", head + tail).strip()
 
-def sse_headers_for_origin(origin: str | None) -> dict[str, str]:
+# ---------- SSE helpers ----------
+def sse_headers_for_origin(origin: Optional[str]) -> Dict[str,str]:
     h = {
-        "Cache-Control": "no-cache",
-        "Connection": "keep-alive",
-        "X-Accel-Buffering": "no",   # disable proxy buffering (nginx-style)
+        "Cache-Control":"no-cache",
+        "Connection":"keep-alive",
+        "X-Accel-Buffering":"no",
     }
-    if origin and (origin in ALLOWED_ORIGINS or "*" in ALLOWED_ORIGINS):
-        h["Access-Control-Allow-Origin"] = origin if origin in ALLOWED_ORIGINS else "*"
+    if origin and (origin in ALLOWED_ORIGINS):
+        h["Access-Control-Allow-Origin"] = origin
         h["Access-Control-Allow-Credentials"] = "true"
         h["Access-Control-Expose-Headers"] = "*"
     return h
 
-# ---- CORS config (exact-origin echo) ----
+# ---------- FastAPI + CORS ----------
 app = FastAPI()
 
 ALLOWED_ORIGINS = {
@@ -276,9 +268,9 @@ ALLOWED_ORIGINS = {
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=list(ALLOWED_ORIGINS),   # credentials safe
+    allow_origins=list(ALLOWED_ORIGINS),
     allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_methods=["GET","POST","OPTIONS"],
     allow_headers=["*"],
     expose_headers=["*"],
     max_age=600,
@@ -286,7 +278,7 @@ app.add_middleware(
 
 @app.middleware("http")
 async def cors_exact_origin(request: Request, call_next):
-    origin = request.headers.get("origin", "")
+    origin = request.headers.get("origin","")
     resp = await call_next(request)
     if origin in ALLOWED_ORIGINS:
         resp.headers["Access-Control-Allow-Origin"] = origin
@@ -298,9 +290,9 @@ async def cors_exact_origin(request: Request, call_next):
         resp.headers["Access-Control-Expose-Headers"] = "*"
     return resp
 
-@app.options("/{rest_of_path:path}")
-def options_preflight(request: Request, rest_of_path: str):
-    origin = request.headers.get("origin", "")
+@app.options("/{rest:path}")
+def options_preflight(request: Request, rest: str):
+    origin = request.headers.get("origin","")
     headers = {}
     if origin in ALLOWED_ORIGINS:
         headers = {
@@ -313,24 +305,21 @@ def options_preflight(request: Request, rest_of_path: str):
         }
     return PlainTextResponse("OK", headers=headers)
 
-# ========= Routes =========
+# ---------- Routes ----------
 @app.get("/")
-def root():
-    return PlainTextResponse("ok")
+def root(): return PlainTextResponse("ok")
 
 @app.get("/health")
-def health():
-    return PlainTextResponse("OK")
+def health(): return PlainTextResponse("OK")
 
 @app.get("/diag_rag")
-def diag():
-    return {"ok": True, "corpora": corpus_counts()}
+def diag(): return {"ok": True, "corpora": corpus_counts()}
 
 def _sys_with_rollup(s: SessionState) -> Dict[str,str]:
     base = s.history[0]["content"]
     if s.rollup:
-        base = base + "\nSESSION_SUMMARY: " + s.rollup
-    return {"role":"system","content":base}
+        base += "\nSESSION_SUMMARY: " + s.rollup
+    return {"role":"system","content": base}
 
 def _maybe_rollup(s: SessionState) -> None:
     if len(s.history) >= 24 and not s.rollup:
@@ -346,7 +335,7 @@ async def chat(request: Request):
     base = Response()
     sid, s = get_or_create_sid(request, base)
 
-    # push user turn
+    # Add user turn
     s.history.append({"role":"user","content":message})
     if len(s.history) > 40:
         s.history = s.history[:1] + s.history[-39:]
@@ -358,10 +347,8 @@ async def chat(request: Request):
         if hits:
             top = hits[0]
             verse = attach_citation(top.get("text",""), top)
-            # system nudge: exactly one quoted verse
             ctx = (
-                "RETRIEVED PASSAGES (quote exactly one verbatim with [CIT:id], "
-                "then add brief guidance):\n"
+                "RETRIEVED PASSAGES (quote at most one verbatim with [CIT:id], then give brief guidance):\n"
                 f"- [{corp}] [CIT:{top.get('ref','')}] {top.get('text','').strip().replace('\n',' ')}"
             )
             sys_msg = _sys_with_rollup(s)
@@ -369,17 +356,15 @@ async def chat(request: Request):
             messages = [sys_msg] + s.history[1:]
             out = call_openai(messages, stream=False)
             reply = out if isinstance(out, str) else "".join(list(out))
-            # ensure at least the verse appears once
             if verse not in reply:
                 reply = verse + "\n\n" + reply
-            # strip accidental second verses heuristically
-            reply = re.sub(r"\[CIT:\s*[^]]+\](?s:.*)\[CIT:\s*[^]]+\]", lambda m: m.group(0).split("[CIT:")[0].strip() + " [CIT:" + m.group(0).split("[CIT:",1)[1].split("]",1)[0] + "]", reply, count=1)
+            reply = keep_one_citation(reply)
             s.history.append({"role":"assistant","content":reply})
             _maybe_rollup(s)
             return JSONResponse({"response": reply, "sid": sid,
                                  "sources":[{"ref": top.get("ref",""), "source": top.get("source","")}]})
 
-    # normal chat
+    # Normal chat
     out = call_openai([_sys_with_rollup(s)] + s.history[1:], stream=False)
     reply = out if isinstance(out, str) else "".join(list(out))
     s.history.append({"role":"assistant","content":reply})
@@ -389,49 +374,37 @@ async def chat(request: Request):
 @app.get("/chat_sse")
 async def chat_sse(request: Request, q: str, sid: Optional[str] = None):
     base = Response()
-
-    # SAFE session acquire; do NOT mutate request.headers
     try:
         if sid and sid in SESSIONS:
             sid2, s = sid, SESSIONS[sid]
         else:
             sid2, s = get_or_create_sid(request, base)
     except Exception:
-        # ultra-safe fallback: never 500 before stream starts
         sid2, s = uuid.uuid4().hex, SessionState()
         SESSIONS[sid2] = s
 
     origin = request.headers.get("origin")
 
     def gen() -> Generator[str, None, None]:
+        # Yield immediately so proxies treat as streaming (no CL:0)
+        yield ": connected\n\n"
+        yield "event: ping\ndata: hi\n\n"
+
         try:
-            # ALWAYS yield something immediately so no Content-Length: 0
-            yield ": connected\n\n"
-            yield "event: ping\ndata: hi\n\n"
-
-            # emotional / explicit ask → try RAG first
             m = q.lower()
-            emotional = any(w in m for w in [
-                "scared","afraid","anxious","nervous","panic","breakup","hurt",
-                "down","lost","depressed","angry","worried","fight","injury",
-                "pain","tired","exhausted","grateful"
-            ])
-            asks_scripture = any(w in m for w in [
-                "verse","scripture","psalm","quote","recite","ayah","surah",
-                "mishnah","talmud","[cit:"
-            ])
 
-            if emotional or asks_scripture:
+            # RAG quick path: explicit ask or emotional language
+            if wants_retrieval(q):
                 corp = detect_corpus(q)
                 hits = hybrid_search(q, corp, top_k=6)
                 if hits:
                     top = hits[0]
                     text = attach_citation(top.get("text",""), top)
-                    # stream the single verse in chunks
+                    # chunk stream
                     buf = ""
                     for token in text.split():
                         buf += token + " "
-                        if re.search(r"[.!?]\s+$", buf) or len(buf) >= 160:
+                        if re.search(r"[.!?]\s+$", buf) or len(buf) >= 200:
                             yield f"data: {json.dumps({'text': buf.strip()})}\n\n"
                             buf = ""
                     if buf:
@@ -442,7 +415,7 @@ async def chat_sse(request: Request, q: str, sid: Optional[str] = None):
                     yield f"event: done\ndata: {json.dumps({'sid': sid2})}\n\n"
                     return
 
-            # normal model stream
+            # Normal LLM streaming
             stream = call_openai(
                 [_sys_with_rollup(s)] + s.history[1:] + [{"role":"user","content":q}],
                 stream=True
@@ -463,17 +436,15 @@ async def chat_sse(request: Request, q: str, sid: Optional[str] = None):
             yield f"event: done\ndata: {json.dumps({'sid': sid2})}\n\n"
 
         except Exception as e:
-            # Surface the error to the client instead of silent close
             yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
 
-    # merge Set-Cookie from base response + explicit SSE/CORS headers + proxy hints
-    hdrs = {**dict(base.headers), **sse_headers_for_origin(origin)}
-    return StreamingResponse(gen(), media_type="text/event-stream", headers=hdrs)
+    headers = {**dict(base.headers), **sse_headers_for_origin(origin)}
+    return StreamingResponse(gen(), media_type="text/event-stream", headers=headers)
 
-# Keep GET stream “waker” for Render
+# Keep simple GET stream (warmup / diagnostics)
 @app.get("/chat_sse_get")
 def chat_sse_get():
-    def gen():
+    def g():
         yield ": connected\n\n"
         yield "data: This is a GET stream endpoint.\n\n"
-    return StreamingResponse(gen(), media_type="text/event-stream")
+    return StreamingResponse(g(), media_type="text/event-stream")
