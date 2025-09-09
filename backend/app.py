@@ -1,16 +1,12 @@
 # backend/app.py
-# LLM API Demo — Fight Chaplain
-# - Streaming SSE (no Set-Cookie on SSE paths)
-# - Session memory for non-SSE POST /chat
-# - Hybrid RAG (optional verse prelude)
-# - Natural citations (— Genesis 1:1)
-# - 7-step operational flow with simple escalation + referral footer
+# Fight Chaplain — SSE streaming, session memory, hybrid RAG, and strict
+# "no-quote-without-RAG" policy to avoid hallucinated scripture.
 
-import os, re, json, uuid, math, asyncio, time
+import os, re, json, uuid, math, asyncio
 from typing import Dict, List, Optional, Any, Tuple
 from pathlib import Path
 
-from fastapi import FastAPI, Request, Response, Query
+from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -54,7 +50,7 @@ def call_openai(messages: List[Dict[str,str]], stream: bool):
         resp = cli.chat.completions.create(
             model=OPENAI_MODEL,
             messages=messages,
-            temperature=0.4,
+            temperature=0.2,          # tighten creativity to reduce drift
             stream=True
         )
         def _gen():
@@ -63,21 +59,22 @@ def call_openai(messages: List[Dict[str,str]], stream: bool):
                 if piece:
                     yield piece
         return _gen()
-    resp = cli.chat.completions.create(model=OPENAI_MODEL, messages=messages, temperature=0.4)
+    resp = cli.chat.completions.create(
+        model=OPENAI_MODEL, messages=messages, temperature=0.2
+    )
     return resp.choices[0].message.content or ""
 
 # ---------- Session ----------
 class SessionState:
     def __init__(self) -> None:
-        # keep a placeholder system to preserve shape; we generate real system via system_message()
-        self.history: List[Dict[str,str]] = [{"role": "system", "content": ""}]
+        # history[0] is a placeholder; we compose a live system each turn
+        self.history: List[Dict[str,str]] = [{"role":"system","content":""}]
         self.rollup: Optional[str] = None
         self.faith: Optional[str] = None  # 'bible' | 'quran' | 'talmud'
 
 SESSIONS: Dict[str, SessionState] = {}
 
 def get_or_create_sid(request: Request, response: Response) -> Tuple[str, SessionState]:
-    """Used by non-SSE routes; sets cookie so /chat POST keeps working as before."""
     sid = request.headers.get("X-Session-Id") or request.cookies.get("sid")
     if not sid:
         sid = uuid.uuid4().hex
@@ -291,25 +288,25 @@ def sse_headers_for_origin(origin: Optional[str]) -> Dict[str,str]:
         h["Access-Control-Expose-Headers"] = "*"
     return h
 
-# ---------- 7-step operational logic ----------
+# ---------- 7-step flow + strict quote policy ----------
 SYSTEM_BASE = """
 You are Fight Chaplain — a calm, concise, spiritually grounded guide for combat sports athletes.
-Speak with honor, courage, grit, and calling. Unisex language only (avoid “brother”).
-Do NOT be a therapist or a chatbot; be a spiritual guide.
+Unisex language only. Do NOT be a therapist or a generic chatbot.
 
-Follow this 7-step flow on every turn:
-1) Begin by acknowledging the fighter’s emotional/spiritual state in respectful, warrior-aware language.
+ALWAYS FOLLOW THIS FLOW:
+1) Begin by acknowledging the fighter’s emotional/spiritual state in warrior-aware language.
 2) Briefly infer emotional tone + readiness (internally) and adapt your guidance.
-3) Offer a short faith-based or reflective message (e.g., perseverance, failure, redemption), rooted in Scripture when appropriate.
-4) Track conversation volume and emotional content; note signs of spiritual crisis or need for further care.
+3) Offer a short faith-based or reflective message (perseverance, failure, redemption).
+4) Track conversation volume + emotional content.
 5) If thresholds trip (keywords or sustained distress), escalate appropriately.
-6) If need exceeds spiritual scope, suggest a mental-health referral (e.g., BetterHelp). Otherwise, prefer referral to a faith leader.
-7) Close each answer by either (a) asking a gentle next question OR (b) offering to connect them with a faith leader of their denomination.
+6) If need exceeds spiritual scope, suggest mental-health referral (e.g., BetterHelp). Otherwise, prefer referral to a faith leader.
+7) Close with either a gentle next question OR an offer to connect them with a faith leader of their denomination.
 
-Constraints:
-- Keep answers tight; avoid filler.
-- When RETRIEVED PASSAGES are provided in context, quote AT MOST ONE short line verbatim, then add brief guidance.
-- Never over-interpret; keep tone steady and reassuring.
+CRITICAL QUOTE POLICY:
+- You MUST NOT quote or cite any scripture (e.g., “Genesis 1:1”, “Quran 94:6”, tractate lines) unless explicit RETRIEVED PASSAGES are provided in context THIS TURN.
+- If no retrieval is provided, speak in universal, non-denominational themes; invite the user to let you pull an exact passage.
+- If the user’s faith is unknown, do not assume or name a tradition; ask gently.
+- When retrieval IS provided, you may quote ONE short line verbatim from it and attribute it naturally (e.g., — John 3:16 / — Quran 94:6 / — Berakhot).
 """.strip()
 
 CRISIS_KEYWORDS = {
@@ -322,12 +319,11 @@ DISTRESS_KEYWORDS = {
 }
 
 class _ChaplainState:
-    __slots__ = ("turns","distress_hits","crisis_hits","last_tone","escalate","faith_pref")
+    __slots__ = ("turns","distress_hits","crisis_hits","escalate","faith_pref")
     def __init__(self) -> None:
         self.turns = 0
         self.distress_hits = 0
         self.crisis_hits = 0
-        self.last_tone = ""
         self.escalate = "none"  # "none" | "watch" | "refer-faith" | "refer-mental-health"
         self.faith_pref = ""
 
@@ -353,7 +349,7 @@ def update_session_metrics(user_text: str, s: SessionState) -> None:
         cs.escalate = "none"
     cs.faith_pref = (s.faith or "").title() if getattr(s, "faith", None) else ""
 
-def system_message(s: SessionState) -> Dict[str,str]:
+def system_message(s: SessionState, *, quote_allowed: bool, faith_known: bool) -> Dict[str,str]:
     base = SYSTEM_BASE
     if s.rollup:
         base += "\n\nSESSION_SUMMARY: " + s.rollup
@@ -366,6 +362,8 @@ def system_message(s: SessionState) -> Dict[str,str]:
         "faith_pref": cs.faith_pref or (s.faith or ""),
     }
     base += "\n\nSESSION_STATUS: " + json.dumps(status, ensure_ascii=False)
+    # turn-local limits so the model knows whether it may quote
+    base += f"\n\nTURN_LIMITS: quote_allowed={str(quote_allowed).lower()}, faith_known={str(faith_known).lower()}"
     base += (
         "\n\nCLOSER_POLICY: Always end with either a gentle next question "
         "OR an offer to connect them with a faith leader of their denomination."
@@ -377,8 +375,8 @@ def apply_referral_footer(final_text: str, s: SessionState) -> str:
     footer = ""
     if cs.escalate == "refer-mental-health":
         footer = (
-            "\n\nIf you’re in immediate danger, please contact local emergency services now. "
-            "For professional counseling, a service like BetterHelp can connect you with a licensed counselor. "
+            "\n\nIf you’re in immediate danger, contact local emergency services. "
+            "For professional counseling, BetterHelp can connect you with a licensed counselor. "
             "I can also connect you with a faith leader if you’d like."
         )
     elif cs.escalate == "refer-faith":
@@ -388,8 +386,7 @@ def apply_referral_footer(final_text: str, s: SessionState) -> str:
     return (final_text or "").rstrip() + footer
 
 ONBOARD_GREETING = (
-    "I’m here as your Fight Chaplain — a steady voice in your corner. "
-    "Competition tests both body and soul; courage and calling both matter. "
+    "Greetings. It’s good to connect. I’m here as your Fight Chaplain — a steady voice in your corner. "
     "How are you holding up right now — mentally, spiritually? "
     "Do you practice within a specific faith tradition?"
 )
@@ -459,7 +456,7 @@ def health(): return PlainTextResponse("OK")
 @app.get("/diag_rag")
 def diag(): return {"ok": True, "corpora": corpus_counts()}
 
-# Non-stream JSON chat (keeps cookie-based session as before)
+# ---- Non-stream JSON chat ----
 @app.post("/chat")
 async def chat(request: Request):
     body = await request.json()
@@ -468,7 +465,7 @@ async def chat(request: Request):
     base = Response()
     sid, s = get_or_create_sid(request, base)
 
-    # onboarding nudge on the very first user turn
+    # gentle onboarding on first user turn
     if len(s.history) <= 1 and msg:
         s.history.append({"role":"assistant","content":ONBOARD_GREETING})
 
@@ -478,24 +475,23 @@ async def chat(request: Request):
     if len(s.history) > 40:
         s.history = s.history[:1] + s.history[-39:]
 
-    # RAG (sync, no SSE)
+    rag_used = False
     if wants_retrieval(msg):
         corp = detect_corpus(msg, s)
         hits = hybrid_search(msg, corp, top_k=6)
         if hits:
+            rag_used = True
             top = hits[0]
             verse = attach_citation(top.get("text",""), top)
             ctx = (
-                "RETRIEVED PASSAGES (a verbatim passage may be quoted; "
-                "refer to it once and add brief guidance):\n"
+                "RETRIEVED PASSAGES (one may be quoted verbatim; attribute naturally):\n"
                 f"- [{corp}] {natural_ref(top)} :: {top.get('text','').strip().replace('\n',' ')}"
             )
-            sys_msg = system_message(s)
+            sys_msg = system_message(s, quote_allowed=True, faith_known=bool(s.faith))
             sys_msg["content"] += "\n\n" + ctx
             messages = [sys_msg] + s.history[1:]
             out = call_openai(messages, stream=False)
             reply = out if isinstance(out, str) else "".join(list(out))
-            # make sure the verse appears before guidance:
             if verse not in reply:
                 reply = verse + "\n\n" + reply
             reply = apply_referral_footer(reply, s)
@@ -507,14 +503,15 @@ async def chat(request: Request):
                 headers={"X-Session-Id": sid}
             )
 
-    out = call_openai([system_message(s)] + s.history[1:], stream=False)
+    # no RAG → quotes forbidden this turn
+    out = call_openai([system_message(s, quote_allowed=False, faith_known=bool(s.faith))] + s.history[1:], stream=False)
     reply = out if isinstance(out, str) else "".join(list(out))
     reply = apply_referral_footer(reply, s)
     s.history.append({"role":"assistant","content":reply})
     _maybe_rollup(s)
     return JSONResponse({"response": reply, "sid": sid, "sources": []}, headers={"X-Session-Id": sid})
 
-# Streaming SSE chat (NO cookies; use sid query or synthesize one)
+# ---- Streaming SSE chat (no cookies) ----
 @app.get("/chat_sse")
 async def chat_sse(request: Request, q: str, sid: Optional[str] = None):
     if sid and sid in SESSIONS:
@@ -524,7 +521,6 @@ async def chat_sse(request: Request, q: str, sid: Optional[str] = None):
         s = SESSIONS.get(sid2) or SessionState()
         SESSIONS[sid2] = s
 
-    # onboarding nudge on very first turn for SSE too (prepend once)
     if len(s.history) <= 1 and q:
         s.history.append({"role":"assistant","content":ONBOARD_GREETING})
 
@@ -541,59 +537,57 @@ async def chat_sse(request: Request, q: str, sid: Optional[str] = None):
             return ("data: " + json.dumps({"text": txt}) + "\n\n").encode("utf-8")
 
         try:
-            messages = [system_message(s)] + s.history[1:] + [{"role":"user","content":q}]
+            rag_used = False
+            messages = [system_message(s, quote_allowed=False, faith_known=bool(s.faith))] + s.history[1:] + [{"role":"user","content":q}]
 
-            # Optional RAG prelude (stream verse first)
+            # Optional RAG prelude when triggered
             if wants_retrieval(q):
                 corp = detect_corpus(q, s)
                 hits = hybrid_search(q, corp, top_k=6)
                 if hits:
+                    rag_used = True
                     top = hits[0]
                     verse = attach_citation(top.get("text",""), top)
 
+                    # stream the verse prelude first
                     pending = ""
-                    last_flush = asyncio.get_event_loop().time()
                     for tok in verse.split():
                         pending += tok + " "
+                        if len(pending) >= 12:
+                            yield emit(pending); pending = ""
                         now = asyncio.get_event_loop().time()
-                        if len(pending) >= 12 or (now - last_flush) >= 0.05:
-                            yield emit(pending); pending = ""; last_flush = now
-                        if (now - last_hb) > 5:
-                            yield b": hb\n\n"; last_hb = now
+                        if (now - last_hb) > 5: yield b": hb\n\n"; last_hb = now
                         await asyncio.sleep(0)
                     if pending: yield emit(pending)
 
+                    # now allow quoting in the system prompt and ask model for guidance
                     ctx = (
-                        "RETRIEVED PASSAGES (a verbatim passage was just shown; "
-                        "refer to it once and add brief guidance):\n"
+                        "RETRIEVED PASSAGES (one was just shown; you may quote exactly once and attribute naturally):\n"
                         f"- [{corp}] {natural_ref(top)} :: {top.get('text','').strip().replace('\n',' ')}"
                     )
-                    sys_msg = system_message(s); sys_msg["content"] += "\n\n" + ctx
+                    sys_msg = system_message(s, quote_allowed=True, faith_known=bool(s.faith))
+                    sys_msg["content"] += "\n\n" + ctx
                     messages = [sys_msg] + s.history[1:] + [{"role":"user","content":q}]
 
             # Stream model guidance
             stream = call_openai(messages, stream=True)
             assistant_out, pending = "", ""
-            last_flush = asyncio.get_event_loop().time()
             for piece in stream:  # type: ignore
                 if not piece: continue
                 pending += piece
+                if len(pending) >= 8 or "\n" in pending:
+                    yield emit(pending); assistant_out += pending; pending = ""
                 now = asyncio.get_event_loop().time()
-                if len(pending) >= 8 or "\n" in pending or (now - last_flush) >= 0.04:
-                    yield emit(pending); assistant_out += pending; pending = ""; last_flush = now
-                if (now - last_hb) > 5:
-                    yield b": hb\n\n"; last_hb = now
+                if (now - last_hb) > 5: yield b": hb\n\n"; last_hb = now
                 await asyncio.sleep(0)
             if pending: yield emit(pending); assistant_out += pending
 
-            # Stream referral footer (if any) as a final chunk so the user sees it too
-            footer_added = apply_referral_footer("", s)
-            footer_added = footer_added.strip()
-            if footer_added:
-                yield emit(footer_added)
+            # footer (if any)
+            footer = apply_referral_footer("", s).strip()
+            if footer: yield emit(footer)
 
-            # Persist turn (store combined)
-            stored = (assistant_out.strip() + ("\n\n" + footer_added if footer_added else "")).strip()
+            # persist
+            stored = (assistant_out.strip() + ("\n\n" + footer if footer else "")).strip()
             s.history.append({"role":"user","content":q})
             s.history.append({"role":"assistant","content":stored})
             _maybe_rollup(s)
@@ -609,17 +603,15 @@ async def chat_sse(request: Request, q: str, sid: Optional[str] = None):
     hdrs["X-Accel-Buffering"] = "no"
     return StreamingResponse(agen(), media_type="text/event-stream; charset=utf-8", headers=hdrs)
 
-# ---------- Infra sanity streamers ----------
+# ---- Infra sanity streams ----
 @app.get("/sse_echo")
 async def sse_echo():
     async def agen():
         i = 0
         while True:
-            await asyncio.sleep(0.4)
-            i += 1
+            await asyncio.sleep(0.4); i += 1
             yield f"data: echo {i}\n\n".encode("utf-8")
-            if i % 12 == 0:
-                yield b": hb\n\n"
+            if i % 12 == 0: yield b": hb\n\n"
     return StreamingResponse(agen(), media_type="text/event-stream; charset=utf-8")
 
 @app.get("/sse_test")
