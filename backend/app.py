@@ -1,7 +1,7 @@
 # backend/app.py
 # LLM API Demo — memory + rollup + hybrid RAG + robust SSE (+ diagnostics)
 # - Normal chat by default (no citations).
-# - RAG triggers on explicit asks (verse/scripture/quote...) OR emotional context.
+# - RAG triggers on explicit asks or emotional context.
 # - Faith remembered in-session; steers retrieval corpus.
 # - SSE endpoints DO NOT set cookies (Cloudflare/proxies can drop bodies when Set-Cookie is present).
 # - Debug endpoints included: /chat_sse_dbg and /sse_echo.
@@ -75,8 +75,8 @@ class SessionState:
                 "You are Fight Chaplain: calm, concise, encouraging. "
                 "Offer practical corner-coach guidance with spiritual grounding. "
                 "Keep answers tight; avoid filler. "
-                "When RETRIEVED PASSAGES are provided, quote AT MOST ONE verbatim "
-                "with the provided [CIT: ref] tag, then give brief guidance."
+                "When RETRIEVED PASSAGES are provided, quote AT MOST ONE verbatim, "
+                "then add brief guidance."
             )
         }]
         self.rollup: Optional[str] = None
@@ -89,7 +89,6 @@ def get_or_create_sid(request: Request, response: Response) -> Tuple[str, Sessio
     sid = request.headers.get("X-Session-Id") or request.cookies.get("sid")
     if not sid:
         sid = uuid.uuid4().hex
-        # OK to set cookie on non-SSE
         response.set_cookie("sid", sid, httponly=True, samesite="none", secure=True, path="/")
     if sid not in SESSIONS:
         SESSIONS[sid] = SessionState()
@@ -130,6 +129,10 @@ def load_jsonl(path: Path) -> List[Dict[str, Any]]:
                 "id": o.get("id") or o.get("ref") or "",
                 "ref": o.get("ref") or o.get("book") or o.get("id") or "",
                 "source": o.get("source") or "",
+                # these may be absent; we’ll parse from text if needed
+                "book": o.get("book") or "",
+                "chapter": o.get("chapter") or o.get("chap") or "",
+                "verse": o.get("verse") or o.get("ayah") or "",
                 "text": t,
                 "embedding": e,
             })
@@ -204,6 +207,59 @@ def wants_retrieval(msg: str) -> bool:
     if any(f" {w} " in m for w in EMO_WORDS): return True
     return False
 
+# ---------- Citation helpers (natural em-dash style) ----------
+_BIBLE_REF_RE = re.compile(
+    r'\b((?:[1-3]\s+)?[A-Za-z][A-Za-z ]{1,23})\s+(\d{1,3}):(\d{1,3})\b'
+)
+# e.g., "Genesis 1:1", "1 John 4:18"
+
+def _clean_book_name(name: str) -> str:
+    name = re.sub(r'\s+', ' ', name.strip())
+    parts = name.split(' ', 1)
+    if len(parts) == 2 and parts[0] in {'1','2','3'}:
+        return parts[0] + ' ' + parts[1].title()
+    return name.title()
+
+def extract_bible_ref_from_text(txt: str) -> str:
+    m = _BIBLE_REF_RE.search(txt or "")
+    if not m:
+        return ""
+    book, chap, verse = m.groups()
+    return f"{_clean_book_name(book)} {int(chap)}:{int(verse)}"
+
+def natural_ref(hit: Dict[str, Any]) -> str:
+    """Best-effort human ref for display after an em dash."""
+    source = (hit.get("source") or "").strip().lower()
+    txt = hit.get("text") or ""
+    if source == "bible":
+        pretty = extract_bible_ref_from_text(txt)
+        if pretty:
+            return pretty
+        label = "Bible"
+    elif source == "quran":
+        label = "Quran"
+    elif source == "talmud":
+        label = "Talmud"
+    else:
+        label = (hit.get("source") or "Source").title()
+
+    ref = (hit.get("ref") or "").strip()
+    for pref in ("bible-", "quran-", "talmud-"):
+        if ref.lower().startswith(pref):
+            ref = ref[len(pref):]
+            break
+    return f"{label} {ref}" if ref else label
+
+def attach_citation(text: str, hit: Optional[Dict[str,Any]]) -> str:
+    """Append an em-dash citation like: '… — Genesis 1:1'."""
+    if not hit:
+        return text
+    ref = natural_ref(hit)
+    if not ref:
+        return text
+    sep = "" if text.endswith(("—","-","–","—")) else " "
+    return f"{text}{sep}— {ref}"
+
 # ---------- Hybrid search ----------
 def hybrid_search(query: str, corpus_name: str, top_k: int = 6) -> List[Dict[str,Any]]:
     docs = CORPORA.get(corpus_name, [])
@@ -244,13 +300,6 @@ def hybrid_search(query: str, corpus_name: str, top_k: int = 6) -> List[Dict[str
     blend = [(alpha*L.get(i,0.0) + (1-alpha)*V.get(i,0.0), i) for i in range(len(docs))]
     blend.sort(reverse=True)
     return [docs[i] for _, i in blend[:top_k]]
-
-def attach_citation(text: str, hit: Optional[Dict[str,Any]]) -> str:
-    if not hit: return text
-    ref = (hit.get("ref") or "").strip()
-    src = (hit.get("source") or "").strip().title() or "Source"
-    if not ref: return text
-    return f"{text} [{src} {ref}]"
 
 # ---------- SSE helpers ----------
 def sse_event(event: Optional[str], data: str) -> str:
@@ -358,9 +407,9 @@ async def chat(request: Request):
             top = hits[0]
             verse = attach_citation(top.get("text",""), top)
             ctx = (
-                "RETRIEVED PASSAGES (quote AT MOST ONE verbatim with [CIT: ref], "
-                "then add brief guidance):\n"
-                f"- [{corp}] [CIT: {top.get('ref','')}] {top.get('text','').strip().replace('\n',' ')}"
+                "RETRIEVED PASSAGES (a verbatim passage may be shown; "
+                "refer to it once and add brief guidance):\n"
+                f"- [{corp}] {natural_ref(top)} :: {top.get('text','').strip().replace('\n',' ')}"
             )
             sys_msg = _sys_with_rollup(s)
             sys_msg["content"] += "\n\n" + ctx
@@ -373,7 +422,7 @@ async def chat(request: Request):
             _maybe_rollup(s)
             return JSONResponse(
                 {"response": reply, "sid": sid,
-                 "sources":[{"ref": top.get("ref",""), "source": top.get("source","")}]},
+                 "sources":[{"ref": natural_ref(top), "source": top.get("source","")}]},
                 headers={"X-Session-Id": sid}
             )
 
@@ -407,16 +456,19 @@ async def chat_sse(request: Request, q: str, sid: Optional[str] = None):
             return ("data: " + json.dumps({"text": txt}) + "\n\n").encode("utf-8")
 
         try:
-            # RAG quick stream first if triggered
+            messages = [_sys_with_rollup(s)] + s.history[1:] + [{"role":"user","content":q}]
+
+            # If RAG triggers, stream the verse FIRST, then continue with model guidance.
             if wants_retrieval(q):
                 corp = detect_corpus(q, s)
                 hits = hybrid_search(q, corp, top_k=6)
                 if hits:
                     top = hits[0]
-                    text = attach_citation(top.get("text",""), top)
+                    verse = attach_citation(top.get("text",""), top)
+
                     pending = ""
                     last_flush = asyncio.get_event_loop().time()
-                    for tok in text.split():
+                    for tok in verse.split():
                         pending += tok + " "
                         now = asyncio.get_event_loop().time()
                         if len(pending) >= 12 or (now - last_flush) >= 0.05:
@@ -426,17 +478,16 @@ async def chat_sse(request: Request, q: str, sid: Optional[str] = None):
                         await asyncio.sleep(0)
                     if pending: yield emit(pending)
 
-                    s.history.append({"role":"user","content":q})
-                    s.history.append({"role":"assistant","content":text})
-                    _maybe_rollup(s)
-                    yield ("event: done\ndata: " + json.dumps({"sid": sid2}) + "\n\n").encode("utf-8")
-                    return
+                    ctx = (
+                        "RETRIEVED PASSAGES (a verbatim passage was just shown; "
+                        "refer to it once and add brief guidance):\n"
+                        f"- [{corp}] {natural_ref(top)} :: {top.get('text','').strip().replace('\n',' ')}"
+                    )
+                    sys_msg = _sys_with_rollup(s); sys_msg["content"] += "\n\n" + ctx
+                    messages = [sys_msg] + s.history[1:] + [{"role":"user","content":q}]
 
-            # Model stream path
-            stream = call_openai(
-                [_sys_with_rollup(s)] + s.history[1:] + [{"role":"user","content":q}],
-                stream=True
-            )
+            # Now stream model guidance
+            stream = call_openai(messages, stream=True)
             assistant_out, pending = "", ""
             last_flush = asyncio.get_event_loop().time()
             for piece in stream:  # type: ignore
@@ -528,7 +579,7 @@ async def chat_sse_dbg(
                 yield ("event: done\ndata: " + json.dumps({"sid": sid2, "trace": trace}) + "\n\n").encode("utf-8")
                 return
 
-            # OpenAI mode
+            # OA path: optional RAG prelude + model guidance
             yield b"event: phase\ndata: oa_start\n\n"
             messages: List[Dict[str,str]] = [_sys_with_rollup(s)] + s.history[1:] + [{"role":"user","content":q}]
 
@@ -538,8 +589,9 @@ async def chat_sse_dbg(
                 if hits:
                     top = hits[0]
                     verse = attach_citation(top.get("text",""), top)
-                    yield emit("info", {"trace": trace, "prelude": "rag", "ref": top.get("ref",""), "source": top.get("source","")})
+                    yield emit("info", {"trace": trace, "prelude": "rag", "ref": natural_ref(top), "source": top.get("source","")})
 
+                    # stream verse first
                     pending = ""
                     last_flush = asyncio.get_event_loop().time()
                     for tok in verse.split():
@@ -552,10 +604,11 @@ async def chat_sse_dbg(
                         await asyncio.sleep(0)
                     if pending: yield emit_text(pending)
 
+                    # augment context and continue to model
                     ctx = (
-                        "RETRIEVED PASSAGES (the verbatim passage may already be shown; "
-                        "refer to it once with [CIT: ref] and add brief guidance):\n"
-                        f"- [{corp}] [CIT: {top.get('ref','')}] {top.get('text','').strip().replace('\n',' ')}"
+                        "RETRIEVED PASSAGES (a verbatim passage was just shown; "
+                        "refer to it once and add brief guidance):\n"
+                        f"- [{corp}] {natural_ref(top)} :: {top.get('text','').strip().replace('\n',' ')}"
                     )
                     sys_msg = _sys_with_rollup(s); sys_msg["content"] += "\n\n" + ctx
                     messages = [sys_msg] + s.history[1:] + [{"role":"user","content":q}]
