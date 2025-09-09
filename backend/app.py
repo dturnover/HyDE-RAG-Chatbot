@@ -1,9 +1,10 @@
 # backend/app.py
 # LLM API Demo — memory + rollup + hybrid RAG + robust SSE (+ diagnostics)
-# - Keeps your env/credentials as-is (OPENAI_API_KEY / OPENAI_MODEL / EMBED_MODEL).
-# - Adds /chat_sse_dbg for deep streaming diagnostics (dev vs OpenAI modes).
-# - Tightens chunk flushing for true token-y output.
-# - Heartbeats every 5s; explicit error frames with trace IDs.
+# - Normal chat by default (no citations).
+# - RAG triggers on explicit asks (verse/scripture/quote...) OR emotional context.
+# - Faith remembered in-session; steers retrieval corpus.
+# - SSE endpoints DO NOT set cookies (Cloudflare/proxies can drop bodies when Set-Cookie is present).
+# - Debug endpoints included: /chat_sse_dbg and /sse_echo.
 
 import os, re, json, uuid, math, asyncio, time
 from typing import Dict, List, Optional, Any, Tuple
@@ -84,9 +85,11 @@ class SessionState:
 SESSIONS: Dict[str, SessionState] = {}
 
 def get_or_create_sid(request: Request, response: Response) -> Tuple[str, SessionState]:
+    """Used by non-SSE routes; sets cookie so /chat POST keeps working as before."""
     sid = request.headers.get("X-Session-Id") or request.cookies.get("sid")
     if not sid:
         sid = uuid.uuid4().hex
+        # OK to set cookie on non-SSE
         response.set_cookie("sid", sid, httponly=True, samesite="none", secure=True, path="/")
     if sid not in SESSIONS:
         SESSIONS[sid] = SessionState()
@@ -336,6 +339,7 @@ def diag(): return {"ok": True, "corpora": corpus_counts()}
 
 @app.post("/chat")
 async def chat(request: Request):
+    # Normal JSON route can still set cookie
     body = await request.json()
     msg = (body.get("message") or "").strip()
 
@@ -379,17 +383,15 @@ async def chat(request: Request):
     _maybe_rollup(s)
     return JSONResponse({"response": reply, "sid": sid, "sources": []}, headers={"X-Session-Id": sid})
 
-# ---------- Normal SSE (trimmed but robust) ----------
+# ---------- Normal SSE (no Set-Cookie) ----------
 @app.get("/chat_sse")
 async def chat_sse(request: Request, q: str, sid: Optional[str] = None):
-    base = Response()
-    try:
-        if sid and sid in SESSIONS:
-            sid2, s = sid, SESSIONS[sid]
-        else:
-            sid2, s = get_or_create_sid(request, base)
-    except Exception:
-        sid2, s = uuid.uuid4().hex, SessionState()
+    # DO NOT set cookies on SSE; use sid from query (or synthesize local sid).
+    if sid and sid in SESSIONS:
+        sid2, s = sid, SESSIONS[sid]
+    else:
+        sid2 = sid or uuid.uuid4().hex
+        s = SESSIONS.get(sid2) or SessionState()
         SESSIONS[sid2] = s
 
     try_set_faith(q, s)
@@ -405,7 +407,7 @@ async def chat_sse(request: Request, q: str, sid: Optional[str] = None):
             return ("data: " + json.dumps({"text": txt}) + "\n\n").encode("utf-8")
 
         try:
-            # RAG quick stream (emit small chunks)
+            # RAG quick stream first if triggered
             if wants_retrieval(q):
                 corp = detect_corpus(q, s)
                 hits = hybrid_search(q, corp, top_k=6)
@@ -430,8 +432,11 @@ async def chat_sse(request: Request, q: str, sid: Optional[str] = None):
                     yield ("event: done\ndata: " + json.dumps({"sid": sid2}) + "\n\n").encode("utf-8")
                     return
 
-            # Model stream (flush per tiny piece)
-            stream = call_openai([_sys_with_rollup(s)] + s.history[1:] + [{"role":"user","content":q}], stream=True)
+            # Model stream path
+            stream = call_openai(
+                [_sys_with_rollup(s)] + s.history[1:] + [{"role":"user","content":q}],
+                stream=True
+            )
             assistant_out, pending = "", ""
             last_flush = asyncio.get_event_loop().time()
             for piece in stream:  # type: ignore
@@ -439,7 +444,7 @@ async def chat_sse(request: Request, q: str, sid: Optional[str] = None):
                 pending += piece
                 now = asyncio.get_event_loop().time()
                 if len(pending) >= 8 or "\n" in pending or (now - last_flush) >= 0.04:
-                    yield emit(pending); assistant_out += pending; pending=""; last_flush = now
+                    yield emit(pending); assistant_out += pending; pending = ""; last_flush = now
                 if (now - last_hb) > 5:
                     yield b": hb\n\n"; last_hb = now
                 await asyncio.sleep(0)
@@ -455,37 +460,28 @@ async def chat_sse(request: Request, q: str, sid: Optional[str] = None):
             yield ("event: error\ndata: " + json.dumps(err) + "\n\n").encode("utf-8")
             yield b": end\n\n"
 
-    hdrs = {**dict(base.headers), **sse_headers_for_origin(origin)}
+    hdrs = {**sse_headers_for_origin(origin)}
     hdrs["Cache-Control"] = "no-cache"
     hdrs["X-Accel-Buffering"] = "no"
-
     return StreamingResponse(agen(), media_type="text/event-stream; charset=utf-8", headers=hdrs)
 
-# ---------- Diagnostic SSE ----------
+# ---------- Diagnostic SSE (no Set-Cookie) ----------
 @app.get("/chat_sse_dbg")
 async def chat_sse_dbg(
     request: Request,
     q: str = Query(""),
     sid: Optional[str] = None,
-    mode: str = Query("dev", pattern="^(dev|oa)$"),  # dev=simulate streaming, oa=OpenAI
-    rag: int = Query(1),                              # 1=enable RAG triggers, 0=off
-    min_chunk: int = Query(8),                        # flush threshold
-    max_flush_ms: int = Query(50)                     # max ms between flushes
+    mode: str = Query("dev", pattern="^(dev|oa)$"),
+    rag: int = Query(1),
+    min_chunk: int = Query(8),
+    max_flush_ms: int = Query(50)
 ):
-    """
-    Verbose debugging streamer. Examples:
-    - /chat_sse_dbg?q=hello&mode=dev
-    - /chat_sse_dbg?q=anxious%20about%20fight&mode=oa&rag=1
-    """
     trace = uuid.uuid4().hex[:8]
-    base = Response()
-    try:
-        if sid and sid in SESSIONS:
-            sid2, s = sid, SESSIONS[sid]
-        else:
-            sid2, s = get_or_create_sid(request, base)
-    except Exception:
-        sid2, s = uuid.uuid4().hex, SessionState()
+    if sid and sid in SESSIONS:
+        sid2, s = sid, SESSIONS[sid]
+    else:
+        sid2 = sid or uuid.uuid4().hex
+        s = SESSIONS.get(sid2) or SessionState()
         SESSIONS[sid2] = s
 
     try_set_faith(q, s)
@@ -493,7 +489,6 @@ async def chat_sse_dbg(
     start_ts = time.time()
 
     async def agen():
-        # meta frame (helps verify CORS + who we are)
         meta = {
             "trace": trace,
             "ts": start_ts,
@@ -506,43 +501,37 @@ async def chat_sse_dbg(
         }
         yield ("event: meta\n" + "data: " + json.dumps(meta) + "\n\n").encode("utf-8")
         yield b": connected\n\n"
-        yield b"event: phase\ndata: prelude\n\n"
 
         last_hb = asyncio.get_event_loop().time()
 
         def emit(kind: str, payload: Any) -> bytes:
-            # kind = "token" or "info" etc.
             return (f"event: {kind}\n" + "data: " + json.dumps(payload) + "\n\n").encode("utf-8")
-
         def emit_text(txt: str) -> bytes:
             return ("data: " + json.dumps({"text": txt}) + "\n\n").encode("utf-8")
 
         try:
-            # DEV MODE: simulate token-by-token so we isolate infra/CORS from OpenAI
             if mode == "dev":
                 yield b"event: phase\ndata: dev_sim_start\n\n"
                 demo = f"[trace {trace}] DEV stream for: " + (q or "(empty)") + " — " + ("RAG ON" if rag else "RAG OFF")
-                i, pending, last_flush = 0, "", asyncio.get_event_loop().time()
+                pending = ""
+                last_flush = asyncio.get_event_loop().time()
                 for ch in demo + "  ✅":
                     pending += ch
-                    i += 1
                     now = asyncio.get_event_loop().time()
                     if len(pending) >= max(1, min_chunk) or (now - last_flush) >= (max_flush_ms/1000.0):
-                        yield emit_text(pending); pending=""; last_flush = now
+                        yield emit_text(pending); pending = ""; last_flush = now
                     if (now - last_hb) > 5:
                         yield b": hb\n\n"; last_hb = now
-                    await asyncio.sleep(0.01)  # visibly trickle
+                    await asyncio.sleep(0.01)
                 if pending: yield emit_text(pending)
                 yield b"event: phase\ndata: dev_sim_done\n\n"
                 yield ("event: done\ndata: " + json.dumps({"sid": sid2, "trace": trace}) + "\n\n").encode("utf-8")
                 return
 
-            # OA MODE: actual model path with optional RAG preview
+            # OpenAI mode
             yield b"event: phase\ndata: oa_start\n\n"
-
             messages: List[Dict[str,str]] = [_sys_with_rollup(s)] + s.history[1:] + [{"role":"user","content":q}]
 
-            # Optional RAG prelude stream
             if rag and wants_retrieval(q):
                 corp = detect_corpus(q, s)
                 hits = hybrid_search(q, corp, top_k=6)
@@ -563,7 +552,6 @@ async def chat_sse_dbg(
                         await asyncio.sleep(0)
                     if pending: yield emit_text(pending)
 
-                    # Also instruct the model briefly with this context:
                     ctx = (
                         "RETRIEVED PASSAGES (the verbatim passage may already be shown; "
                         "refer to it once with [CIT: ref] and add brief guidance):\n"
@@ -572,39 +560,33 @@ async def chat_sse_dbg(
                     sys_msg = _sys_with_rollup(s); sys_msg["content"] += "\n\n" + ctx
                     messages = [sys_msg] + s.history[1:] + [{"role":"user","content":q}]
 
-            # Model streaming
             stream = call_openai(messages, stream=True)
             assistant_out, pending = "", ""
             last_flush = asyncio.get_event_loop().time()
-            count = 0
-            async_sleep = asyncio.sleep  # micro-opt
-
             for piece in stream:  # type: ignore
                 if not piece: continue
-                pending += piece; count += 1
+                pending += piece
                 now = asyncio.get_event_loop().time()
                 if len(pending) >= max(2, min_chunk) or "\n" in pending or (now - last_flush) >= (max_flush_ms/1000.0):
                     yield emit_text(pending); assistant_out += pending; pending=""; last_flush = now
                 if (now - last_hb) > 5:
                     yield b": hb\n\n"; last_hb = now
-                await async_sleep(0)
-
+                await asyncio.sleep(0)
             if pending: yield emit_text(pending); assistant_out += pending
 
             s.history.append({"role":"user","content":q})
             s.history.append({"role":"assistant","content":assistant_out.strip()})
             _maybe_rollup(s)
-            yield ("event: done\ndata: " + json.dumps({"sid": sid2, "trace": trace, "chunks": count}) + "\n\n").encode("utf-8")
+            yield ("event: done\ndata: " + json.dumps({"sid": sid2, "trace": trace}) + "\n\n").encode("utf-8")
 
         except Exception as e:
             err = {"trace": trace, "error": str(e)}
             yield ("event: error\ndata: " + json.dumps(err) + "\n\n").encode("utf-8")
             yield b": end\n\n"
 
-    hdrs = {**dict(base.headers), **sse_headers_for_origin(origin)}
+    hdrs = {**sse_headers_for_origin(origin)}
     hdrs["Cache-Control"] = "no-cache"
     hdrs["X-Accel-Buffering"] = "no"
-
     return StreamingResponse(agen(), media_type="text/event-stream; charset=utf-8", headers=hdrs)
 
 # ---------- Infinite echo (infra sanity) ----------
