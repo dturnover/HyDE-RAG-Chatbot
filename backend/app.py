@@ -1,13 +1,14 @@
 # backend/app.py
-# LLM API Demo — memory + rollup + hybrid RAG + robust SSE
+# LLM API Demo — memory + rollup + hybrid RAG + robust SSE (stream-first)
 # - Normal chat by default (no citations).
 # - RAG triggers on explicit asks (verse/scripture/quote...) OR emotional context.
 # - Faith is remembered in-session and routes retrieval to the matching corpus.
-# - Only ONE verbatim passage is quoted with [CIT: ref] before guidance.
-# - SSE streams immediately with heartbeats and proxy headers.
+# - EXACTLY ONE verbatim passage may be shown. For SSE we pre-emit it quickly,
+#   then the model streams concise guidance (asked not to re-quote verbatim).
+# - SSE flushes tiny pieces quickly; heartbeats keep proxies/CDNs happy.
 
 import os, re, json, uuid, math, asyncio
-from typing import Dict, List, Optional, Any, Tuple, Generator
+from typing import Dict, List, Optional, Any, Tuple
 from pathlib import Path
 
 from fastapi import FastAPI, Request, Response
@@ -33,7 +34,7 @@ def oa_client() -> Optional[OpenAI]:
 
 def embed_query(text: str) -> Optional[List[float]]:
     cli = oa_client()
-    if not cli: 
+    if not cli:
         return None
     try:
         r = cli.embeddings.create(model=EMBED_MODEL, input=text)
@@ -51,11 +52,16 @@ def call_openai(messages: List[Dict[str,str]], stream: bool):
             return _gen()
         return "⚠️ OpenAI disabled on server; running in dev mode."
     if stream:
-        resp = cli.chat.completions.create(model=OPENAI_MODEL, messages=messages, temperature=0.4, stream=True)
+        resp = cli.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=messages,
+            temperature=0.4,
+            stream=True
+        )
         def _gen():
             for ev in resp:
                 piece = ev.choices[0].delta.content or ""
-                if piece: 
+                if piece:
                     yield piece
         return _gen()
     resp = cli.chat.completions.create(model=OPENAI_MODEL, messages=messages, temperature=0.4)
@@ -83,6 +89,7 @@ def get_or_create_sid(request: Request, response: Response) -> Tuple[str, Sessio
     sid = request.headers.get("X-Session-Id") or request.cookies.get("sid")
     if not sid:
         sid = uuid.uuid4().hex
+        # third-party cookie friendly
         response.set_cookie("sid", sid, httponly=True, samesite="none", secure=True, path="/")
     if sid not in SESSIONS:
         SESSIONS[sid] = SessionState()
@@ -117,7 +124,7 @@ def load_jsonl(path: Path) -> List[Dict[str, Any]]:
             except Exception:
                 continue
             t, e = o.get("text"), o.get("embedding")
-            if t is None or e is None: 
+            if t is None or e is None:
                 continue
             rows.append({
                 "id": o.get("id") or o.get("ref") or "",
@@ -196,7 +203,7 @@ EMO_WORDS = [
 
 def wants_retrieval(msg: str) -> bool:
     m = f" {msg.lower()} "
-    if any(f" {w} " in m for w in ASK_WORDS): 
+    if any(f" {w} " in m for w in ASK_WORDS):
         return True
     if any(f" {w} " in m for w in EMO_WORDS):
         return True
@@ -248,16 +255,14 @@ def hybrid_search(query: str, corpus_name: str, top_k: int = 6) -> List[Dict[str
 def attach_citation(text: str, hit: Optional[Dict[str,Any]]) -> str:
     """
     Render a single, compact citation like [Quran p25] / [Bible p1245] / [Talmud p1531].
-    (We only have the short ref id; if you later add full book:verse, format it here.)
     """
-    if not hit: 
+    if not hit:
         return text
     ref = (hit.get("ref") or "").strip()
     src = (hit.get("source") or "").strip().title() or "Source"
     if not ref:
         return text
     return f"{text} [{src} {ref}]"
-
 
 # ---------- SSE helpers ----------
 def sse_event(event: Optional[str], data: str) -> str:
@@ -357,7 +362,6 @@ async def chat(request: Request):
     if len(s.history) > 40:
         s.history = s.history[:1] + s.history[-39:]
 
-    sources: List[Dict[str,Any]] = []
     if wants_retrieval(msg):
         corp = detect_corpus(msg, s)
         hits = hybrid_search(msg, corp, top_k=6)
@@ -403,94 +407,109 @@ async def chat_sse(request: Request, q: str, sid: Optional[str] = None):
         sid2, s = uuid.uuid4().hex, SessionState()
         SESSIONS[sid2] = s
 
-    # update faith memory now, before any retrieval
+    # update faith memory before retrieval
     try_set_faith(q, s)
     origin = request.headers.get("origin")
 
     async def agen():
-        # Always send something immediately so the connection isn't 200/empty
+        # prelude ensures immediate data so the client sees a hot stream
         yield b": connected\n\n"
         yield b"event: ping\ndata: hi\n\n"
 
         last_hb = asyncio.get_event_loop().time()
 
-        def chunk_emit(txt: str):
-            # one data frame
+        def chunk_emit(txt: str) -> bytes:
+            # One SSE data frame with JSON {text: "..."}
             return ("data: " + json.dumps({"text": txt}) + "\n\n").encode("utf-8")
 
+        assistant_out = ""
+
         try:
-            # RAG branch first if trigger fires
+            # If retrieval is warranted: emit the single passage fast, then stream model guidance
+            sys_msg = _sys_with_rollup(s)
+            messages = s.history[1:] + [{"role":"user","content":q}]
+
             if wants_retrieval(q):
                 corp = detect_corpus(q, s)
                 hits = hybrid_search(q, corp, top_k=6)
                 if hits:
                     top = hits[0]
-                    text = attach_citation(top.get("text",""), top)
+                    verse_text = attach_citation(top.get("text",""), top)
 
-                    # emit in sentence-ish chunks
-                    buf = ""
-                    for tok in text.split():
-                        buf += tok + " "
-                        if re.search(r"[.!?]\s+$", buf) or len(buf) >= 240:
-                            yield chunk_emit(buf.strip())
-                            buf = ""
-                            # heartbeat if needed
-                            now = asyncio.get_event_loop().time()
-                            if now - last_hb > 10:
-                                yield b": hb\n\n"
-                                last_hb = now
-                            await asyncio.sleep(0)  # cooperative yield
-                    if buf:
-                        yield chunk_emit(buf.strip())
+                    # Emit the verse immediately (small chunk cadence)
+                    chunk = ""
+                    for tok in verse_text.split():
+                        chunk += tok + " "
+                        if len(chunk) >= 12:
+                            yield chunk_emit(chunk)
+                            assistant_out += chunk
+                            chunk = ""
+                            await asyncio.sleep(0)
+                    if chunk:
+                        yield chunk_emit(chunk)
+                        assistant_out += chunk
 
-                    # persist turn and end
-                    s.history.append({"role":"user","content":q})
-                    s.history.append({"role":"assistant","content":text})
-                    _maybe_rollup(s)
-                    yield ("event: done\ndata: " + json.dumps({"sid": sid2}) + "\n\n").encode("utf-8")
-                    return
+                    # Now instruct the model with the retrieved context.
+                    # Ask it NOT to re-quote verbatim; refer to [CIT: ref] once, then guidance.
+                    ctx = (
+                        "RETRIEVED PASSAGES (the verbatim passage may already be shown to the user; "
+                        "do NOT repeat it verbatim; instead refer to it once with [CIT: ref] and add brief guidance):\n"
+                        f"- [{corp}] [CIT: {top.get('ref','')}] {top.get('text','').strip().replace('\n',' ')}"
+                    )
+                    sys_msg = _sys_with_rollup(s)
+                    sys_msg["content"] += "\n\n" + ctx
+                    messages = [sys_msg] + s.history[1:] + [{"role":"user","content":q}]
 
-            # Model streaming path
-            stream = call_openai(
-                [_sys_with_rollup(s)] + s.history[1:] + [{"role":"user","content":q}],
-                stream=True
-            )
+            # Stream the model output in tiny pieces
+            stream = call_openai(messages if isinstance(messages[0], dict) and messages[0].get("role")=="system"
+                                 else [_sys_with_rollup(s)] + messages,
+                                 stream=True)
 
-            # If dev mode returns a plain generator of words:
-            buf = ""
+            pending = ""
+            last_flush = asyncio.get_event_loop().time()
+
             for piece in stream:  # type: ignore
-                buf += piece
-                # flush on sentence end or every ~240 chars
-                if re.search(r"[.!?]\s+$", buf) or len(buf) >= 240:
-                    yield chunk_emit(buf.strip())
-                    buf = ""
-                    now = asyncio.get_event_loop().time()
-                    if now - last_hb > 10:
-                        yield b": hb\n\n"
-                        last_hb = now
+                if not piece:
+                    continue
+                pending += piece
+                now = asyncio.get_event_loop().time()
+
+                # flush quickly for a token-y feel
+                if len(pending) >= 8 or "\n" in pending or (now - last_flush) >= 0.04:
+                    yield chunk_emit(pending)
+                    assistant_out += pending
+                    pending = ""
+                    last_flush = now
+
+                # heartbeat every ~10s
+                if (now - last_hb) > 10:
+                    yield b": hb\n\n"
+                    last_hb = now
+
                 await asyncio.sleep(0)  # cooperative yield
 
-            if buf:
-                yield chunk_emit(buf.strip())
+            if pending:
+                yield chunk_emit(pending)
+                assistant_out += pending
 
+            # persist turn
             s.history.append({"role":"user","content":q})
-            s.history.append({"role":"assistant","content":""})
+            s.history.append({"role":"assistant","content":assistant_out.strip()})
             _maybe_rollup(s)
+
+            # done
             yield ("event: done\ndata: " + json.dumps({"sid": sid2}) + "\n\n").encode("utf-8")
 
         except Exception as e:
-            # Don’t drop the socket empty—tell the client why
             err = {"error": str(e)}
             yield ("event: error\ndata: " + json.dumps(err) + "\n\n").encode("utf-8")
-            # soft landing so browsers don’t treat it as a network failure
             yield b": end\n\n"
 
-    # headers: merge cookie + SSE/CORS + proxy hints
     hdrs = {**dict(base.headers), **sse_headers_for_origin(origin)}
     hdrs["Cache-Control"] = "no-cache"
     hdrs["X-Accel-Buffering"] = "no"
 
-    return StreamingResponse(agen(), media_type="text/event-stream", headers=hdrs)
+    return StreamingResponse(agen(), media_type="text/event-stream; charset=utf-8", headers=hdrs)
 
 @app.get("/sse_test")
 async def sse_test():
@@ -500,7 +519,7 @@ async def sse_test():
             await asyncio.sleep(0.4)
             yield f"data: tick {i}\n\n".encode("utf-8")
         yield b"event: done\ndata: ok\n\n"
-    return StreamingResponse(agen(), media_type="text/event-stream")
+    return StreamingResponse(agen(), media_type="text/event-stream; charset=utf-8")
 
 # Minimal GET streamer to keep platforms happy
 @app.get("/chat_sse_get")
@@ -508,4 +527,4 @@ def chat_sse_get():
     def gen():
         yield ": connected\n\n"
         yield sse_event(None, "This is a GET stream endpoint.")
-    return StreamingResponse(gen(), media_type="text/event-stream")
+    return StreamingResponse(gen(), media_type="text/event-stream; charset=utf-8")
