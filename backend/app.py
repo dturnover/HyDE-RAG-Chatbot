@@ -246,10 +246,18 @@ def hybrid_search(query: str, corpus_name: str, top_k: int = 6) -> List[Dict[str
     return [docs[i] for _, i in blend[:top_k]]
 
 def attach_citation(text: str, hit: Optional[Dict[str,Any]]) -> str:
-    if not hit: return text
+    """
+    Render a single, compact citation like [Quran p25] / [Bible p1245] / [Talmud p1531].
+    (We only have the short ref id; if you later add full book:verse, format it here.)
+    """
+    if not hit: 
+        return text
     ref = (hit.get("ref") or "").strip()
-    if not ref: return text
-    return f"{text} [CIT: {ref}]"
+    src = (hit.get("source") or "").strip().title() or "Source"
+    if not ref:
+        return text
+    return f"{text} [{src} {ref}]"
+
 
 # ---------- SSE helpers ----------
 def sse_event(event: Optional[str], data: str) -> str:
