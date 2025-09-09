@@ -1,5 +1,5 @@
 # backend/app.py
-# Fight Chaplain — SSE streaming, session memory, hybrid RAG, and strict
+# Fight Chaplain — SSE streaming, session memory, HYBRID RAG, and strict
 # "no-quote-without-RAG" policy to avoid hallucinated scripture.
 
 import os, re, json, uuid, math, asyncio
@@ -50,7 +50,7 @@ def call_openai(messages: List[Dict[str,str]], stream: bool):
         resp = cli.chat.completions.create(
             model=OPENAI_MODEL,
             messages=messages,
-            temperature=0.2,          # tighten creativity to reduce drift
+            temperature=0.2,     # tighter to reduce drift
             stream=True
         )
         def _gen():
@@ -194,29 +194,42 @@ def wants_retrieval(msg: str) -> bool:
     if any(f" {w} " in m for w in EMO_WORDS): return True
     return False
 
-# ---------- Natural citation helpers ----------
+# ---------- Passage cleaning & pretty citation ----------
+_BRACKET_RE = re.compile(r"\s*\[[^\]]*\]\s*")   # remove KJV editorial [words]
+_WS_RE = re.compile(r"\s+")
+
+def clean_passage(txt: str) -> str:
+    """Remove editorial [brackets], collapse whitespace, trim."""
+    if not txt: return ""
+    txt = _BRACKET_RE.sub(" ", txt)
+    txt = _WS_RE.sub(" ", txt)
+    return txt.strip()
+
 _BIBLE_REF_RE = re.compile(r'\b((?:[1-3]\s+)?[A-Za-z][A-Za-z ]{1,23})\s+(\d{1,3}):(\d{1,3})\b')
+
 def _clean_book_name(name: str) -> str:
     name = re.sub(r'\s+', ' ', name.strip())
     parts = name.split(' ', 1)
     if len(parts) == 2 and parts[0] in {'1','2','3'}:
         return parts[0] + ' ' + parts[1].title()
     return name.title()
+
 def extract_bible_ref_from_text(txt: str) -> str:
     m = _BIBLE_REF_RE.search(txt or "")
     if not m: return ""
     book, chap, verse = m.groups()
     return f"{_clean_book_name(book)} {int(chap)}:{int(verse)}"
+
 def natural_ref(hit: Dict[str, Any]) -> str:
-    source = (hit.get("source") or "").strip().lower()
+    src = (hit.get("source") or "").strip().lower()
     txt = hit.get("text") or ""
-    if source == "bible":
+    if src == "bible":
         pretty = extract_bible_ref_from_text(txt)
         if pretty: return pretty
         label = "Bible"
-    elif source == "quran":
+    elif src == "quran":
         label = "Quran"
-    elif source == "talmud":
+    elif src == "talmud":
         label = "Talmud"
     else:
         label = (hit.get("source") or "Source").title()
@@ -226,15 +239,12 @@ def natural_ref(hit: Dict[str, Any]) -> str:
             ref = ref[len(pref):]
             break
     return f"{label} {ref}" if ref else label
-def attach_citation(text: str, hit: Optional[Dict[str,Any]]) -> str:
-    if not hit: return text
-    ref = natural_ref(hit)
-    if not ref: return text
-    sep = "" if text.endswith(("—","-","–","—")) else " "
-    return f"{text}{sep}— {ref}"
 
 # ---------- Hybrid search ----------
 def hybrid_search(query: str, corpus_name: str, top_k: int = 6) -> List[Dict[str,Any]]:
+    """
+    Hybrid = lexical (Jaccard on tokens) + vector (cosine on embeddings) with z-score blend.
+    """
     docs = CORPORA.get(corpus_name, [])
     if not docs: return []
     q_tokens = set(tokenize(query))
@@ -303,10 +313,10 @@ ALWAYS FOLLOW THIS FLOW:
 7) Close with either a gentle next question OR an offer to connect them with a faith leader of their denomination.
 
 CRITICAL QUOTE POLICY:
-- You MUST NOT quote or cite any scripture (e.g., “Genesis 1:1”, “Quran 94:6”, tractate lines) unless explicit RETRIEVED PASSAGES are provided in context THIS TURN.
-- If no retrieval is provided, speak in universal, non-denominational themes; invite the user to let you pull an exact passage.
+- You MUST NOT quote or cite any scripture unless explicit RETRIEVED PASSAGES are provided THIS TURN.
+- If no retrieval is provided, speak in universal themes; invite the user to let you pull an exact passage.
 - If the user’s faith is unknown, do not assume or name a tradition; ask gently.
-- When retrieval IS provided, you may quote ONE short line verbatim from it and attribute it naturally (e.g., — John 3:16 / — Quran 94:6 / — Berakhot).
+- When retrieval IS provided, quote ONE short line verbatim and attribute naturally with an em dash (— Book C:V or tradition label).
 """.strip()
 
 CRISIS_KEYWORDS = {
@@ -362,7 +372,6 @@ def system_message(s: SessionState, *, quote_allowed: bool, faith_known: bool) -
         "faith_pref": cs.faith_pref or (s.faith or ""),
     }
     base += "\n\nSESSION_STATUS: " + json.dumps(status, ensure_ascii=False)
-    # turn-local limits so the model knows whether it may quote
     base += f"\n\nTURN_LIMITS: quote_allowed={str(quote_allowed).lower()}, faith_known={str(faith_known).lower()}"
     base += (
         "\n\nCLOSER_POLICY: Always end with either a gentle next question "
@@ -386,8 +395,7 @@ def apply_referral_footer(final_text: str, s: SessionState) -> str:
     return (final_text or "").rstrip() + footer
 
 ONBOARD_GREETING = (
-    "Greetings. It’s good to connect. I’m here as your Fight Chaplain — a steady voice in your corner. "
-    "How are you holding up right now — mentally, spiritually? "
+    "Hello! It’s great to hear from you. How are you feeling today, both in and out of the ring? "
     "Do you practice within a specific faith tradition?"
 )
 
@@ -465,7 +473,7 @@ async def chat(request: Request):
     base = Response()
     sid, s = get_or_create_sid(request, base)
 
-    # gentle onboarding on first user turn
+    # onboarding on first user turn
     if len(s.history) <= 1 and msg:
         s.history.append({"role":"assistant","content":ONBOARD_GREETING})
 
@@ -475,31 +483,37 @@ async def chat(request: Request):
     if len(s.history) > 40:
         s.history = s.history[:1] + s.history[-39:]
 
-    rag_used = False
     if wants_retrieval(msg):
         corp = detect_corpus(msg, s)
         hits = hybrid_search(msg, corp, top_k=6)
         if hits:
-            rag_used = True
             top = hits[0]
-            verse = attach_citation(top.get("text",""), top)
-            ctx = (
-                "RETRIEVED PASSAGES (one may be quoted verbatim; attribute naturally):\n"
-                f"- [{corp}] {natural_ref(top)} :: {top.get('text','').strip().replace('\n',' ')}"
+            clean_text = clean_passage(top.get("text",""))
+            pretty_ref = natural_ref(top)
+
+            interleave_rule = (
+                "QUOTE STYLE:\n"
+                "- Use curly quotes around ONE short quoted line, then an em dash and the natural ref, e.g., "
+                "“He maketh my feet like hinds’ feet.” — 2 Samuel 22:34\n"
+                "- Surround the quote with 1–2 sentences of guidance BEFORE and AFTER. Do not quote twice."
             )
+            ctx = (
+                "RETRIEVED PASSAGES (you may quote EXACTLY ONE short line verbatim; then weave brief guidance around it):\n"
+                f"- {pretty_ref} :: {clean_text}"
+            )
+
             sys_msg = system_message(s, quote_allowed=True, faith_known=bool(s.faith))
-            sys_msg["content"] += "\n\n" + ctx
+            sys_msg["content"] += "\n\n" + interleave_rule + "\n" + ctx
             messages = [sys_msg] + s.history[1:]
+
             out = call_openai(messages, stream=False)
             reply = out if isinstance(out, str) else "".join(list(out))
-            if verse not in reply:
-                reply = verse + "\n\n" + reply
             reply = apply_referral_footer(reply, s)
             s.history.append({"role":"assistant","content":reply})
             _maybe_rollup(s)
             return JSONResponse(
                 {"response": reply, "sid": sid,
-                 "sources":[{"ref": natural_ref(top), "source": top.get("source","")}]},
+                 "sources":[{"ref": pretty_ref, "source": top.get("source","")}]},
                 headers={"X-Session-Id": sid}
             )
 
@@ -511,7 +525,7 @@ async def chat(request: Request):
     _maybe_rollup(s)
     return JSONResponse({"response": reply, "sid": sid, "sources": []}, headers={"X-Session-Id": sid})
 
-# ---- Streaming SSE chat (no cookies) ----
+# ---- Streaming SSE chat (no cookies used here) ----
 @app.get("/chat_sse")
 async def chat_sse(request: Request, q: str, sid: Optional[str] = None):
     if sid and sid in SESSIONS:
@@ -537,39 +551,34 @@ async def chat_sse(request: Request, q: str, sid: Optional[str] = None):
             return ("data: " + json.dumps({"text": txt}) + "\n\n").encode("utf-8")
 
         try:
-            rag_used = False
-            messages = [system_message(s, quote_allowed=False, faith_known=bool(s.faith))] + s.history[1:] + [{"role":"user","content":q}]
+            # default: no quotes allowed unless RAG hits
+            sys_msg = system_message(s, quote_allowed=False, faith_known=bool(s.faith))
+            messages = [sys_msg] + s.history[1:] + [{"role":"user","content":q}]
 
-            # Optional RAG prelude when triggered
             if wants_retrieval(q):
                 corp = detect_corpus(q, s)
                 hits = hybrid_search(q, corp, top_k=6)
                 if hits:
-                    rag_used = True
                     top = hits[0]
-                    verse = attach_citation(top.get("text",""), top)
+                    clean_text = clean_passage(top.get("text",""))
+                    pretty_ref = natural_ref(top)
 
-                    # stream the verse prelude first
-                    pending = ""
-                    for tok in verse.split():
-                        pending += tok + " "
-                        if len(pending) >= 12:
-                            yield emit(pending); pending = ""
-                        now = asyncio.get_event_loop().time()
-                        if (now - last_hb) > 5: yield b": hb\n\n"; last_hb = now
-                        await asyncio.sleep(0)
-                    if pending: yield emit(pending)
-
-                    # now allow quoting in the system prompt and ask model for guidance
-                    ctx = (
-                        "RETRIEVED PASSAGES (one was just shown; you may quote exactly once and attribute naturally):\n"
-                        f"- [{corp}] {natural_ref(top)} :: {top.get('text','').strip().replace('\n',' ')}"
+                    interleave_rule = (
+                        "QUOTE STYLE:\n"
+                        "- Use curly quotes around ONE short quoted line, then an em dash and the natural ref, e.g., "
+                        "“He maketh my feet like hinds’ feet.” — 2 Samuel 22:34\n"
+                        "- Surround the quote with 1–2 sentences of guidance BEFORE and AFTER. Do not quote twice."
                     )
+                    ctx = (
+                        "RETRIEVED PASSAGES (you may quote EXACTLY ONE short line verbatim; then weave brief guidance around it):\n"
+                        f"- {pretty_ref} :: {clean_text}"
+                    )
+
                     sys_msg = system_message(s, quote_allowed=True, faith_known=bool(s.faith))
-                    sys_msg["content"] += "\n\n" + ctx
+                    sys_msg["content"] += "\n\n" + interleave_rule + "\n" + ctx
                     messages = [sys_msg] + s.history[1:] + [{"role":"user","content":q}]
 
-            # Stream model guidance
+            # stream model guidance
             stream = call_openai(messages, stream=True)
             assistant_out, pending = "", ""
             for piece in stream:  # type: ignore
