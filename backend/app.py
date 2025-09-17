@@ -70,7 +70,7 @@ class SessionState:
         # history[0] is a placeholder; we compose a live system each turn
         self.history: List[Dict[str,str]] = [{"role":"system","content":""}]
         self.rollup: Optional[str] = None
-        self.faith: Optional[str] = None  # 'bible' | 'quran' | 'talmud'
+        self.faith: Optional[str] = None  # route key, e.g., 'bible_asv' | 'quran' | 'tanakh' | 'gita' | 'dhammapada' | 'bible_nrsv'
 
 SESSIONS: Dict[str, SessionState] = {}
 
@@ -127,8 +127,17 @@ def load_jsonl(path: Path) -> List[Dict[str, Any]]:
     return rows
 
 def find_and_load_corpora() -> Dict[str, List[Dict[str, Any]]]:
-    files = ("bible.jsonl", "quran.jsonl", "talmud.jsonl")
-    corpora: Dict[str, List[Dict[str, Any]]] = {"bible": [], "quran": [], "talmud": []}
+    files = (
+        "bible_asv.jsonl",
+        "bible_nrsv.jsonl",
+        "quran.jsonl",
+        "tanakh.jsonl",
+        "gita.jsonl",
+        "dhammapada.jsonl",
+    )
+    corpora: Dict[str, List[Dict[str, Any]]] = {
+        "bible_asv": [], "bible_nrsv": [], "quran": [], "tanakh": [], "gita": [], "dhammapada": []
+    }
     for base in _candidate_index_dirs():
         for name in files:
             p = base / name
@@ -161,9 +170,24 @@ def cos(a: List[float], b: List[float]) -> float:
 
 # ---------- Faith memory ----------
 FAITH_KEYWORDS = {
-    "jewish": "talmud", "jew": "talmud", "hebrew": "talmud",
-    "muslim": "quran", "islam": "quran",
-    "christian": "bible", "catholic": "bible", "protestant": "bible",
+    # Christianity (route by denomination/family)
+    "catholic": "bible_nrsv",
+    "orthodox": "bible_nrsv",
+    "protestant": "bible_asv",
+    "evangelical": "bible_asv",
+    "christian": "bible_asv",
+
+    # Judaism
+    "jewish": "tanakh", "jew": "tanakh", "hebrew": "tanakh",
+
+    # Islam
+    "muslim": "quran", "islam": "quran", "quran": "quran", "koran": "quran",
+
+    # Hindu
+    "hindu": "gita", "bhagavad": "gita", "gita": "gita",
+
+    # Buddhist
+    "buddhist": "dhammapada", "buddhism": "dhammapada", "dhammapada": "dhammapada",
 }
 
 def try_set_faith(msg: str, s: SessionState) -> None:
@@ -175,14 +199,21 @@ def try_set_faith(msg: str, s: SessionState) -> None:
             return
 
 def detect_corpus(msg: str, s: SessionState) -> str:
-    if s.faith: return s.faith
+    if s.faith: 
+        return s.faith
     m = msg.lower()
-    if any(w in m for w in ["quran","surah","ayah"]): return "quran"
-    if any(w in m for w in ["talmud","tractate","mishnah","gemara"]): return "talmud"
-    return "bible"
+    # keyword sniff
+    for k, corp in FAITH_KEYWORDS.items():
+        if k in m:
+            return corp
+    # explicit words / fallbacks
+    if any(w in m for w in ["surah","ayah"]): return "quran"
+    if any(w in m for w in ["tractate","mishnah","gemara"]): return "tanakh"  # adjust if you add Talmud later
+    if "bible" in m: return "bible_asv"
+    return "bible_asv"
 
 # ---------- RAG triggers ----------
-ASK_WORDS = ["verse","scripture","psalm","quote","passage","ayah","surah","quran","bible","talmud","tractate"]
+ASK_WORDS = ["verse","scripture","psalm","quote","passage","ayah","surah","quran","bible","tanakh","gita","dhammapada"]
 EMO_WORDS = [
     "scared","afraid","anxious","nervous","panic","hurt","down","lost","depressed",
     "angry","worried","fight","injury","pain","tired","exhausted","grief","grieving",
@@ -221,24 +252,31 @@ def extract_bible_ref_from_text(txt: str) -> str:
     return f"{_clean_book_name(book)} {int(chap)}:{int(verse)}"
 
 def natural_ref(hit: Dict[str, Any]) -> str:
+    """Prefer the row's own 'ref' (emitted by our chunker). Fallbacks retained for legacy rows."""
     src = (hit.get("source") or "").strip().lower()
+    ref = (hit.get("ref") or "").strip()
+    if ref:
+        if src in ("bible_asv","bible_nrsv","tanakh"):
+            return ref                       # e.g., "Genesis 1:3"
+        if src == "quran":
+            return f"Qur’an {ref}"           # e.g., "Qur’an 2:255"
+        if src == "gita":
+            return ref                       # e.g., "Bhagavad Gita 8:6"
+        if src == "dhammapada":
+            return ref                       # e.g., "Dhammapada 277"
+        return ref
+
+    # legacy fallback (older rows without ref)
     txt = hit.get("text") or ""
-    if src == "bible":
+    if src.startswith("bible"):
         pretty = extract_bible_ref_from_text(txt)
         if pretty: return pretty
-        label = "Bible"
-    elif src == "quran":
-        label = "Quran"
-    elif src == "talmud":
-        label = "Talmud"
-    else:
-        label = (hit.get("source") or "Source").title()
-    ref = (hit.get("ref") or "").strip()
-    for pref in ("bible-", "quran-", "talmud-"):
-        if ref.lower().startswith(pref):
-            ref = ref[len(pref):]
-            break
-    return f"{label} {ref}" if ref else label
+        return "Bible"
+    if src == "quran": return "Qur’an"
+    if src == "tanakh": return "Tanakh"
+    if src == "gita": return "Bhagavad Gita"
+    if src == "dhammapada": return "Dhammapada"
+    return (hit.get("source") or "Source").title()
 
 # ---------- Hybrid search ----------
 def hybrid_search(query: str, corpus_name: str, top_k: int = 6) -> List[Dict[str,Any]]:
