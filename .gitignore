@@ -1,2 +1,23 @@
 backend/.env
 nul
+
+# --- data / artifacts (never commit) ---
+backend/indexes/
+backend/corpus/
+backend/jsonl_raw/
+__pycache__/
+*.pyc
+*.pyo
+
+# local env / venvs
+.venv/
+venv/
+.env
+
+# archives & dumps
+*.tar
+*.tar.gz
+*.zip
+
+# accidental bare mirror repo
+LLM-API-DEMO.git/

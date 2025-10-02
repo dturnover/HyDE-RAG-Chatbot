@@ -1,3 +1,0 @@
-backend/indexes/*.jsonl filter=lfs diff=lfs merge=lfs -text
-backend/indexes/*.jsonl filter=lfs diff=lfs merge=lfs -text
-backend/indexes/*.jsonl filter=lfs diff=lfs merge=lfs -text
