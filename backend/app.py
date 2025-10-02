@@ -1,20 +1,27 @@
-# backend/app.py
-# Fight Chaplain — SSE streaming, session memory, HYBRID RAG, and strict
-# "no-quote-without-RAG" policy to avoid hallucinated scripture.
+# Fight Chaplain Backend - app.py
+#
+# This version implements on-disk streaming RAG to conserve RAM, addressing OOM issues.
+# It maintains session state, streaming responses (SSE), and the strict 7-step chaplain flow.
 
-import os, re, json, uuid, math, asyncio
+import os, re, json, uuid, math, asyncio, heapq
 from typing import Dict, List, Optional, Any, Tuple
 from pathlib import Path
+from dataclasses import dataclass, field
 
-from fastapi import FastAPI, Request, Response
-from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
+from fastapi import FastAPI, Request, Response, HTTPException
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.datastructures import MutableHeaders
+from starlette.middleware.base import BaseHTTPMiddleware
+from http.cookies import SimpleCookie
 
-# ---------- OpenAI client ----------
+# --- 1. CONFIGURATION & EXTERNAL CLIENTS ---
+
 try:
+    # Requires 'openai' library
     from openai import OpenAI
     _HAS_OPENAI = True
-except Exception:
+except ImportError:
     _HAS_OPENAI = False
     OpenAI = None  # type: ignore
 
@@ -23,657 +30,679 @@ OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-4o-mini") or "gpt-4o-mini"
 EMBED_MODEL    = os.getenv("EMBED_MODEL", "text-embedding-3-small")
 
 def oa_client() -> Optional[OpenAI]:
-    if not (_HAS_OPENAI and OPENAI_API_KEY):
-        return None
-    return OpenAI(api_key=OPENAI_API_KEY)
+    """Returns an OpenAI client if API key is present."""
+    return OpenAI(api_key=OPENAI_API_KEY) if (_HAS_OPENAI and OPENAI_API_KEY) else None
 
 def embed_query(text: str) -> Optional[List[float]]:
+    """Generates an embedding for a query using OpenAI (vector search step)."""
     cli = oa_client()
-    if not cli:
-        return None
+    if not cli: return None
     try:
         r = cli.embeddings.create(model=EMBED_MODEL, input=text)
-        return r.data[0].embedding  # type: ignore
+        return r.data[0].embedding
     except Exception:
+        # Logging here would be useful, but we simply return None to disable vector search
         return None
 
 def call_openai(messages: List[Dict[str,str]], stream: bool):
+    """Calls OpenAI chat completion, handling dev mode and streaming."""
     cli = oa_client()
     if not cli:
+        dev_msg = "⚠️ OpenAI disabled on server; running in dev mode."
         if stream:
-            def _gen():
-                for w in "Dev mode: OpenAI disabled on server.".split():
-                    yield w + " "
-            return _gen()
-        return "⚠️ OpenAI disabled on server; running in dev mode."
+            return (w + " " for w in dev_msg.split())
+        return dev_msg
+    
+    kwargs = dict(model=OPENAI_MODEL, messages=messages, temperature=0.2, stream=stream)
+    
+    try:
+        resp = cli.chat.completions.create(**kwargs)
+    except Exception as e:
+        err_msg = f"OpenAI API Error: {str(e)}"
+        if stream:
+            return (w + " " for w in err_msg.split())
+        return err_msg
+
     if stream:
-        resp = cli.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=messages,
-            temperature=0.2,     # tighter to reduce drift
-            stream=True
-        )
         def _gen():
             for ev in resp:
                 piece = ev.choices[0].delta.content or ""
-                if piece:
-                    yield piece
+                if piece: yield piece
         return _gen()
-    resp = cli.chat.completions.create(
-        model=OPENAI_MODEL, messages=messages, temperature=0.2
-    )
+    
     return resp.choices[0].message.content or ""
 
-# ---------- Session ----------
+# --- 2. SESSION MANAGEMENT & STATE ---
+
+@dataclass
+class _ChaplainState:
+    """Internal state for the chaplain's escalation logic."""
+    turns: int = 0
+    distress_hits: int = 0
+    crisis_hits: int = 0
+    escalate: str = "none" # "none" | "watch" | "refer-faith" | "refer-mental-health"
+    faith_pref: str = ""
+
+@dataclass
 class SessionState:
-    def __init__(self) -> None:
-        # history[0] is a placeholder; we compose a live system each turn
-        self.history: List[Dict[str,str]] = [{"role":"system","content":""}]
-        self.rollup: Optional[str] = None
-        self.faith: Optional[str] = None  # route key, e.g., 'bible_asv' | 'quran' | 'tanakh' | 'gita' | 'dhammapada' | 'bible_nrsv'
+    """Represents the state of a user session."""
+    # Note: history[0] is always the ONBOARD_GREETING substitute when we save.
+    history: List[Dict[str,str]] = field(default_factory=lambda: [{"role":"system","content":""}])
+    rollup: Optional[str] = None # Placeholder for future memory summarization
+    faith: Optional[str] = None  # 'bible_asv' | 'quran' | etc.
+    _chap: _ChaplainState = field(default_factory=_ChaplainState)
 
 SESSIONS: Dict[str, SessionState] = {}
 
-def get_or_create_sid(request: Request, response: Response) -> Tuple[str, SessionState]:
+def get_or_create_sid(request: Request, response: Optional[Response] = None) -> Tuple[str, SessionState]:
+    """Gets/creates session ID and state, setting a cookie if response is provided."""
     sid = request.headers.get("X-Session-Id") or request.cookies.get("sid")
+    is_new_session = not sid
+    
     if not sid:
         sid = uuid.uuid4().hex
-        response.set_cookie("sid", sid, httponly=True, samesite="none", secure=True, path="/")
+
     if sid not in SESSIONS:
         SESSIONS[sid] = SessionState()
+        is_new_session = True
+        
+    # If a Response object is passed (meaning this is the first interaction), set the cookie.
+    if response and is_new_session:
+        # Secure, httponly, and samesite="none" are crucial for cross-site cookie settings
+        response.set_cookie("sid", sid, httponly=True, samesite="none", secure=True, path="/")
+        
     return sid, SESSIONS[sid]
 
-# ---------- Index loading ----------
-def _candidate_index_dirs() -> List[Path]:
-    here = Path(__file__).parent.resolve()
-    env = os.getenv("RAG_DIR", "").strip()
-    cands: List[Path] = []
-    if env: cands.append(Path(env))
-    cands += [
-        here / "indexes",
-        here / "backend" / "indexes",
-        Path("/opt/render/project/src/indexes"),
-    ]
-    seen, out = set(), []
-    for p in cands:
-        if str(p) not in seen:
-            out.append(p); seen.add(str(p))
-    return out
+# --- 3. INDEX DISCOVERY (ON-DISK STREAMING SETUP) ---
+# NOTE: This section replaces the old memory-loading index logic.
 
-def load_jsonl(path: Path) -> List[Dict[str, Any]]:
-    rows: List[Dict[str, Any]] = []
-    if not path.exists(): return rows
+SOURCE_NORMALIZER = {
+    "asvhb": "bible_asv", "asv": "bible_asv", "nrsv": "bible_nrsv",
+    "tanakh": "tanakh", "quran": "quran", "gita": "gita", "bhagavad gita": "gita",
+    "dhammapada": "dhammapada", "bible_asv": "bible_asv", "bible_nrsv": "bible_nrsv",
+}
+VALID_CORPORA = set(SOURCE_NORMALIZER.values())
+
+def _candidate_index_dirs() -> List[Path]:
+    """Determines potential index directories for RAG files."""
+    here = Path(__file__).parent.resolve()
+    env_dir = Path(os.getenv("RAG_DIR", "").strip())
+    
+    cands = [p for p in [env_dir, here / "indexes", here.parent / "indexes", Path("/opt/render/project/src/indexes")] if p and p.is_dir()]
+    return list(dict.fromkeys(cands))
+
+def discover_corpora() -> Dict[str, Path]:
+    """Locates the on-disk path for each corpus JSONL file (does NOT load content)."""
+    names = {
+        "bible_asv": "bible_asv_embed.jsonl",
+        "bible_nrsv": "bible_nrsv_embed.jsonl",
+        "quran":     "quran_embed.jsonl",
+        "tanakh":    "tanakh_embed.jsonl",
+        "gita":      "gita_embed.jsonl",
+        "dhammapada":"dhammapada_embed.jsonl",
+    }
+    legacy_names = {k: f"{k}.jsonl" for k in VALID_CORPORA}
+
+    found: Dict[str, Path] = {}
+    
+    for base in _candidate_index_dirs():
+        # Search for modern names first
+        for key, fname in names.items():
+            p = base / fname
+            if key not in found and p.exists() and p.stat().st_size > 0:
+                found[key] = p
+        # Search for legacy names second
+        for key, fname in legacy_names.items():
+            if key not in found:
+                p = base / fname
+                if p.exists() and p.stat().st_size > 0:
+                    found[key] = p
+                    
+    return found
+
+# Global dictionary holding corpus name -> file path. This is tiny.
+CORPUS_FILES: Dict[str, Path] = discover_corpora()
+
+def corpus_counts() -> Dict[str, int]:
+    """Lazy line counts for health/diag endpoint."""
+    _cache = getattr(corpus_counts, "_cache", None)
+    if isinstance(_cache, dict): return _cache
+    counts: Dict[str, int] = {}
+    for k, path in CORPUS_FILES.items():
+        try:
+            # Simple line count to estimate size without loading
+            n = 0
+            with path.open("r", encoding="utf-8", errors="ignore") as f:
+                for _ in f: n += 1
+            counts[k] = n
+        except Exception:
+            counts[k] = 0
+    setattr(corpus_counts, "_cache", counts)
+    return counts
+
+# --- 4. TEXT & MATH UTILITIES (HYBRID SEARCH FOUNDATION) ---
+
+def tokenize(s: str) -> set[str]: 
+    """Tokenizes text for lexical search."""
+    return set(re.findall(r"[A-Za-z0-9]+", s.lower()))
+
+def jaccard(a: set[str], b: set[str]) -> float:
+    """Calculates Jaccard similarity (keyword overlap)."""
+    if not a or not b: return 0.0
+    inter = len(a & b); union = len(a | b)
+    return inter / union if union else 0.0
+
+def cos(a: List[float], b: List[float]) -> float:
+    """Calculates cosine similarity (vector angle)."""
+    if not (a and b): return 0.0
+    s, na, nb = 0.0, 0.0, 0.0
+    for x, y in zip(a, b):
+        s += x * y; na += x * x; nb += y * y
+    return s / math.sqrt(na * nb) if na > 0 and nb > 0 else 0.0
+
+@dataclass
+class _Stat:
+    """Welford's algorithm for streaming mean/variance calculation (low RAM)."""
+    n: int = 0
+    mean: float = 0.0
+    M2: float = 0.0
+    def push(self, x: float):
+        self.n += 1
+        delta = x - self.mean
+        self.mean += delta / self.n
+        self.M2 += delta * (x - self.mean)    
+    @property
+    def std(self) -> float:
+        # Use 1.0 as fallback to prevent division by zero and maintain z-score scale
+        return math.sqrt(self.M2 / self.n) if self.n >= 2 else 1.0 
+
+
+def _iter_jsonl_rows(path: Path):
+    """Generator to stream rows from a JSONL file on disk."""
     with path.open("r", encoding="utf-8", errors="ignore") as f:
         for line in f:
             line = line.strip()
             if not line: continue
             try:
-                o = json.loads(line)
+                yield json.loads(line)
             except Exception:
                 continue
-            t, e = o.get("text"), o.get("embedding")
-            if t is None or e is None:
-                continue
-            rows.append({
-                "id": o.get("id") or o.get("ref") or "",
-                "ref": o.get("ref") or o.get("book") or o.get("id") or "",
-                "source": o.get("source") or "",
-                "book": o.get("book") or "",
-                "chapter": o.get("chapter") or o.get("chap") or "",
-                "verse": o.get("verse") or o.get("ayah") or "",
-                "text": t,
-                "embedding": e,
-            })
-    return rows
 
-def find_and_load_corpora() -> Dict[str, List[Dict[str, Any]]]:
-    files = (
-        "bible_asv.jsonl",
-        "bible_nrsv.jsonl",
-        "quran.jsonl",
-        "tanakh.jsonl",
-        "gita.jsonl",
-        "dhammapada.jsonl",
-    )
-    corpora: Dict[str, List[Dict[str, Any]]] = {
-        "bible_asv": [], "bible_nrsv": [], "quran": [], "tanakh": [], "gita": [], "dhammapada": []
-    }
-    for base in _candidate_index_dirs():
-        for name in files:
-            p = base / name
-            if p.exists() and p.stat().st_size > 0:
-                key = name.split(".")[0]
-                if not corpora[key]:
-                    corpora[key] = load_jsonl(p)
-    return corpora
+def _normalize_output_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Ensures RAG results match the expected structure for the system prompt."""
+    out_rows = []
+    for row in rows:
+        out_rows.append({
+            "id": row.get("id") or row.get("ref") or "",
+            "ref": row.get("ref") or row.get("book") or row.get("id") or "",
+            "source": row.get("source") or "",
+            "book": row.get("book") or "",
+            "chapter": row.get("chapter") or row.get("chap") or "",
+            "verse": row.get("verse") or row.get("ayah") or "",
+            "text": row.get("text") or "",
+            "embedding": row.get("embedding") or [],
+        })
+    return out_rows
 
-CORPORA: Dict[str, List[Dict[str, Any]]] = find_and_load_corpora()
-def corpus_counts() -> Dict[str,int]: return {k: len(v) for k,v in CORPORA.items()}
+def hybrid_search(query: str, corpus_name: str, top_k: int = 6) -> List[Dict[str, Any]]:
+    """
+    On-disk streaming Hybrid (Jaccard + Cosine) search.
+    This runs two passes over the file on disk, keeping only top-K candidates in RAM.
+    """
+    path = CORPUS_FILES.get(corpus_name)
+    if not path or not path.exists():
+        return []
 
-# ---------- Text utils ----------
-def tokenize(s: str) -> List[str]: return re.findall(r"[A-Za-z0-9]+", s.lower())
+    q_tokens = tokenize(query)
+    q_emb = embed_query(query)
+    
+    OVER = max(top_k * 8, 50) # Over-fetch window size
+    
+    # --- PASS 1: lexical and preliminary candidate selection ---
+    lex_stat = _Stat()
+    lex_heap: list[tuple[float, int, Dict[str, Any]]] = []
+    
+    for i, row in enumerate(_iter_jsonl_rows(path)):
+        txt = row.get("text") or ""
+        if not txt: continue
+        js = jaccard(q_tokens, tokenize(txt))
+        lex_stat.push(js)
+        
+        if js > 0.0:
+            if len(lex_heap) < OVER:
+                heapq.heappush(lex_heap, (js, i, row))
+            elif js > lex_heap[0][0]:
+                heapq.heapreplace(lex_heap, (js, i, row))
 
-def jaccard(a: set[str], b: set[str]) -> float:
-    if not a or not b: return 0.0
-    inter = len(a & b); union = len(a | b)
-    return inter/union if union else 0.0
+    if lex_stat.n == 0:
+        return []
 
-def cos(a: List[float], b: List[float]) -> float:
-    if not a or not b: return 0.0
-    s = 0.0; na = 0.0; nb = 0.0
-    n = min(len(a), len(b))
-    for i in range(n):
-        x, y = a[i], b[i]
-        s += x*y; na += x*x; nb += y*y
-    if na == 0 or nb == 0: return 0.0
-    return s / math.sqrt(na*nb)
+    # Normalize lexical scores for the kept pool
+    mean_L, std_L = lex_stat.mean, (lex_stat.std or 1.0)
+    candidates = {(j, idx): row for (j, idx, row) in lex_heap} # {(score, index): row}
+    Lz = {(j, idx): (j - mean_L) / std_L for (j, idx, _row) in lex_heap}
+    
+    # Fallback to lexical-only if no embeddings are available
+    if not q_emb:
+        blend = []
+        alpha = 0.9
+        for (j, idx), row in candidates.items():
+            blend.append( (alpha*Lz[(j, idx)] + (1-alpha)*0.0, idx, row) )
+        blend.sort(reverse=True, key=lambda t: t[0])
+        return _normalize_output_rows([r for _,__,r in blend[:top_k]])
 
-# ---------- Faith memory ----------
+    # --- PASS 2: vector stats and second round candidate selection ---
+    vec_stat = _Stat()
+    vec_heap: list[tuple[float, int, Dict[str, Any]]] = []
+    
+    for i, row in enumerate(_iter_jsonl_rows(path)):
+        e = row.get("embedding")
+        if not isinstance(e, list): continue
+        
+        s = cos(q_emb, e)
+        vec_stat.push(s)
+
+        if len(vec_heap) < OVER:
+            heapq.heappush(vec_heap, (s, i, row))
+        elif s > vec_heap[0][0]:
+            heapq.heapreplace(vec_heap, (s, i, row))
+
+    mean_V, std_V = vec_stat.mean, (vec_stat.std or 1.0)
+    
+    # Build vector z map
+    Vz: Dict[int, float] = {}
+    for s, i, _row in vec_heap:
+        Vz[i] = (s - mean_V) / std_V
+
+    # Backfill Vz for lexical-strong rows that weren't vector-strong enough to be in vec_heap
+    lex_indices = {idx for (_, idx) in candidates.keys()}
+    for idx in lex_indices:
+        if idx not in Vz:
+            Vz[idx] = (0.0 - mean_V) / std_V # Assign neutral/low vector score
+
+    # --- BLEND ---
+    alpha = 0.6 # Weight favoring lexical score
+    blended: List[tuple[float, int, Dict[str, Any]]] = []
+    
+    for (j_score, idx), row in candidates.items():
+        lz = Lz[(j_score, idx)]
+        vz = Vz.get(idx, 0.0)
+        sc = alpha*lz + (1 - alpha)*vz
+        blended.append((sc, idx, row))
+        
+    blended.sort(reverse=True, key=lambda t: t[0])
+    
+    return _normalize_output_rows([r for _, _, r in blended[:top_k]])
+
+# --- 5. CHAPLAIN AI LOGIC & STATE UPDATE ---
+
+ONBOARD_GREETING = "I am the Fight Chaplain. My role is to offer spiritual guidance and connect you with verses from your tradition. How can I support you today? (Please specify your faith, e.g., 'Christian,' 'Muslim,' or 'Hindu.')"
+
+SYSTEM_BASE_FLOW = """
+You are the Fight Chaplain. You are a highly professional, empathetic, and strictly non-denominational spiritual guide.
+Your entire purpose is to support a person navigating stressful situations or seeking spiritual insight.
+You must adhere to the following 7-step flow in every response:
+1. **Acknowledge and Validate:** Start by recognizing the user's emotion or need with empathy.
+2. **Determine RAG:** Check if a quote is provided in the context.
+3. **If RAG is available (Quote Allowed):** Weave the provided scripture, quote, or passage *seamlessly* and briefly into your response. Do not quote more than one short line verbatim. The entire reply must be centered on the retrieved text.
+4. **If RAG is NOT available (No Quote Allowed):** DO NOT under any circumstances invent or quote scripture, verses, or religious passages. Instead, provide empathetic, non-denominational, practical, and supportive guidance only. You must state your inability to quote if the user has not specified their faith.
+5. **Guidance and Context:** Provide brief, supportive, and action-oriented guidance based on the context.
+6. **Referral Check:** If the session status demands it, append the mandatory referral message (either faith leader or mental health).
+7. **Invite Continuation:** End with an open-ended question to encourage the user to continue the conversation.
+"""
+
+# Keywords for RAG trigger and escalation
+ASK_WORDS = {"verse","scripture","psalm","quote","passage","ayah","surah","quran","bible","tanakh","gita","dhammapada"}
+DISTRESS_KEYWORDS = {"scared","anxious","worried","hurt","down","lost","depressed","angry","grief","lonely","alone","doubt","stress"}
+CRISIS_KEYWORDS = {"panic","suicide","kill myself","hopeless","end it","emergency","self-harm"}
+
+# Keywords to detect faith preference
 FAITH_KEYWORDS = {
-    # Christianity (route by denomination/family)
-    "catholic": "bible_nrsv",
-    "orthodox": "bible_nrsv",
-    "protestant": "bible_asv",
-    "evangelical": "bible_asv",
-    "christian": "bible_asv",
-
-    # Judaism
-    "jewish": "tanakh", "jew": "tanakh", "hebrew": "tanakh",
-
-    # Islam
-    "muslim": "quran", "islam": "quran", "quran": "quran", "koran": "quran",
-
-    # Hindu
-    "hindu": "gita", "bhagavad": "gita", "gita": "gita",
-
-    # Buddhist
-    "buddhist": "dhammapada", "buddhism": "dhammapada", "dhammapada": "dhammapada",
+    "catholic": "bible_nrsv", "orthodox": "bible_nrsv", "protestant": "bible_asv", 
+    "evangelical": "bible_asv", "christian": "bible_asv", "jewish": "tanakh", 
+    "jew": "tanakh", "hebrew": "tanakh", "muslim": "quran", "islam": "quran", 
+    "quran": "quran", "koran": "quran", "hindu": "gita", "bhagavad": "gita", 
+    "gita": "gita", "buddhist": "dhammapada", "buddhism": "dhammapada", 
+    "dhammapada": "dhammapada",
 }
 
+# Very big corpora (avoid scanning unless faith is known)
+BIG_CORPORA = {"bible_nrsv", "tanakh", "bible_asv"}
+
 def try_set_faith(msg: str, s: SessionState) -> None:
+    """Sets the session faith preference if a keyword is found."""
     m = msg.lower()
-    blob = f" {m} "
+    if s.faith: return
+    
     for k, corp in FAITH_KEYWORDS.items():
-        if f" {k} " in blob or m.startswith(k) or m.endswith(k):
+        if f" {k} " in f" {m} " or m.startswith(k) or m.endswith(k):
             s.faith = corp
             return
 
 def detect_corpus(msg: str, s: SessionState) -> str:
-    if s.faith: 
-        return s.faith
+    """Determines the most appropriate corpus based on session state or message keywords."""
+    if s.faith: return s.faith
+    
     m = msg.lower()
-    # keyword sniff
     for k, corp in FAITH_KEYWORDS.items():
-        if k in m:
-            return corp
-    # explicit words / fallbacks
+        if k in m: return corp
+        
     if any(w in m for w in ["surah","ayah"]): return "quran"
-    if any(w in m for w in ["tractate","mishnah","gemara"]): return "tanakh"  # adjust if you add Talmud later
+    if any(w in m for w in ["tractate","mishnah","gemara"]): return "tanakh"
     if "bible" in m: return "bible_asv"
-    return "bible_asv"
+    return "bible_asv" # Default if nothing is detected
 
-# ---------- RAG triggers ----------
-ASK_WORDS = ["verse","scripture","psalm","quote","passage","ayah","surah","quran","bible","tanakh","gita","dhammapada"]
-EMO_WORDS = [
-    "scared","afraid","anxious","nervous","panic","hurt","down","lost","depressed",
-    "angry","worried","fight","injury","pain","tired","exhausted","grief","grieving",
-    "lonely","alone","breakup","fear","doubt","stress","stressed"
-]
+def allowed_corpus_for(msg: str, s: SessionState) -> Optional[str]:
+    """
+    Guard function: Chooses a corpus but prevents scanning giant files 
+    if the user's faith is not yet established in the session state.
+    """
+    corp = detect_corpus(msg, s)
+    if s.faith: 
+        return corp
+    
+    # If no faith set, avoid big corpora unless explicitly requested
+    if corp in BIG_CORPORA:
+        m = msg.lower()
+        if any(w in m for w in ["qur", "koran", "allah"]): return "quran"
+        if "gita" in m: return "gita"
+        if "dhamma" in m or "buddh" in m: return "dhammapada"
+        
+        # Deny RAG if large corpus is implied but faith is not confirmed
+        return None
+        
+    return corp
+
 def wants_retrieval(msg: str) -> bool:
+    """Checks if the user's message indicates a need for RAG."""
     m = f" {msg.lower()} "
-    if any(f" {w} " in m for w in ASK_WORDS): return True
-    if any(f" {w} " in m for w in EMO_WORDS): return True
-    return False
+    return any(f" {w} " in m for w in ASK_WORDS | DISTRESS_KEYWORDS)
 
-# ---------- Passage cleaning & pretty citation ----------
-_BRACKET_RE = re.compile(r"\s*\[[^\]]*\]\s*")   # remove KJV editorial [words]
-_WS_RE = re.compile(r"\s+")
-
-def clean_passage(txt: str) -> str:
-    """Remove editorial [brackets], collapse whitespace, trim."""
-    if not txt: return ""
-    txt = _BRACKET_RE.sub(" ", txt)
-    txt = _WS_RE.sub(" ", txt)
-    return txt.strip()
-
-_BIBLE_REF_RE = re.compile(r'\b((?:[1-3]\s+)?[A-Za-z][A-Za-z ]{1,23})\s+(\d{1,3}):(\d{1,3})\b')
-
-def _clean_book_name(name: str) -> str:
-    name = re.sub(r'\s+', ' ', name.strip())
-    parts = name.split(' ', 1)
-    if len(parts) == 2 and parts[0] in {'1','2','3'}:
-        return parts[0] + ' ' + parts[1].title()
-    return name.title()
-
-def extract_bible_ref_from_text(txt: str) -> str:
-    m = _BIBLE_REF_RE.search(txt or "")
-    if not m: return ""
-    book, chap, verse = m.groups()
-    return f"{_clean_book_name(book)} {int(chap)}:{int(verse)}"
+def clean_passage(text: str) -> str:
+    """Cleans up text for the system prompt to maintain quality."""
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text[:200] + '...' if len(text) > 200 else text
 
 def natural_ref(hit: Dict[str, Any]) -> str:
-    """Prefer the row's own 'ref' (emitted by our chunker). Fallbacks retained for legacy rows."""
-    src = (hit.get("source") or "").strip().lower()
-    ref = (hit.get("ref") or "").strip()
-    if ref:
-        if src in ("bible_asv","bible_nrsv","tanakh"):
-            return ref                       # e.g., "Genesis 1:3"
-        if src == "quran":
-            return f"Qur’an {ref}"           # e.g., "Qur’an 2:255"
-        if src == "gita":
-            return ref                       # e.g., "Bhagavad Gita 8:6"
-        if src == "dhammapada":
-            return ref                       # e.g., "Dhammapada 277"
-        return ref
+    """Formats the reference for the system prompt."""
+    source = hit.get("source", "").upper()
+    book = hit.get("book", "")
+    chap = hit.get("chapter", "")
+    verse = hit.get("verse", "")
+    if source == "QURAN":
+        return f"Qur'an (Surah {chap}:{verse})"
+    if source in ("BIBLE_ASV", "BIBLE_NRSV", "TANAKH"):
+        return f"{book} {chap}:{verse}"
+    if source == "GITA":
+        return f"Bhagavad Gita ({chap}.{verse})"
+    if source == "DHAMMAPADA":
+        return f"Dhammapada ({chap}.{verse})"
+    return f"{book} {chap} {verse} ({source})"
 
-    # legacy fallback (older rows without ref)
-    txt = hit.get("text") or ""
-    if src.startswith("bible"):
-        pretty = extract_bible_ref_from_text(txt)
-        if pretty: return pretty
-        return "Bible"
-    if src == "quran": return "Qur’an"
-    if src == "tanakh": return "Tanakh"
-    if src == "gita": return "Bhagavad Gita"
-    if src == "dhammapada": return "Dhammapada"
-    return (hit.get("source") or "Source").title()
+def update_session_metrics(msg: str, s: SessionState) -> None:
+    """Updates turn count and escalation metrics."""
+    s._chap.turns += 1
+    m = msg.lower()
+    
+    # Check for crisis keywords first
+    if any(w in m for w in CRISIS_KEYWORDS):
+        s._chap.crisis_hits += 1
+        s._chap.escalate = "refer-mental-health"
+        return
 
-# ---------- Hybrid search ----------
-def hybrid_search(query: str, corpus_name: str, top_k: int = 6) -> List[Dict[str,Any]]:
-    """
-    Hybrid = lexical (Jaccard on tokens) + vector (cosine on embeddings) with z-score blend.
-    """
-    docs = CORPORA.get(corpus_name, [])
-    if not docs: return []
-    q_tokens = set(tokenize(query))
+    # Check for general distress keywords
+    if any(w in m for w in DISTRESS_KEYWORDS):
+        s._chap.distress_hits += 1
+        
+    # Escalation rules
+    if s._chap.crisis_hits > 0 and s._chap.escalate != "refer-mental-health":
+         s._chap.escalate = "refer-mental-health"
+    elif s._chap.turns >= 12 and s._chap.escalate == "none":
+        s._chap.escalate = "refer-faith" # Long conversation, suggest a faith leader
+    elif s._chap.distress_hits >= 5 and s._chap.escalate == "none":
+        s._chap.escalate = "refer-faith" # Repeated distress, suggest a faith leader
+    elif s._chap.escalate == "watch" and s._chap.distress_hits == 0:
+        s._chap.escalate = "none" # De-escalate if distress subsides
 
-    lex_scores: List[Tuple[float,int]] = []
-    any_lex = False
-    for i, d in enumerate(docs):
-        t = d.get("text","")
-        js = jaccard(q_tokens, set(tokenize(t))) if t else 0.0
-        if js > 0.0: any_lex = True
-        lex_scores.append((js, i))
+def apply_referral_footer(text: str, status: str) -> str:
+    """Appends mandatory referral text based on escalation status."""
+    if status == "refer-mental-health":
+        text += "\n\n**Mandatory Referral:** If you or someone you know is in crisis, please call or text 988 in the US/Canada, or search for a local crisis line immediately. Your safety is paramount."
+    elif status == "refer-faith":
+        text += "\n\n**Note:** For deeper, personalized guidance, please consider reaching out to a local faith leader or spiritual counselor who can provide direct support and prayer."
+    return text
 
-    q_emb = embed_query(query)
-    any_vec = False
-    if q_emb:
-        vec_scores = []
-        for i, d in enumerate(docs):
-            e = d.get("embedding")
-            s = cos(q_emb, e) if isinstance(e, list) else 0.0
-            if s > 0.05: any_vec = True
-            vec_scores.append((s, i))
-    else:
-        vec_scores = [(0.0, i) for i in range(len(docs))]
+def system_message(s: SessionState, quote_allowed: bool, faith_known: bool, retrieval_ctx: Optional[str]) -> Dict[str, str]:
+    """Constructs the LLM system message with all context and rules."""
+    
+    # RAG rule enforcement (Crucial step 4)
+    rag_instruction = "You are FORBIDDEN from inventing or quoting scripture."
+    if quote_allowed:
+        rag_instruction = "You MUST use the provided passage and adhere to step 3."
+    elif not faith_known:
+        rag_instruction += " You must gently ask the user to specify their faith/tradition to unlock scripture support."
 
-    if not any_lex and not any_vec:
-        return []
-
-    def zscore(lst: List[Tuple[float,int]]) -> Dict[int,float]:
-        vals = [x for x,_ in lst]
-        mu = sum(vals)/len(vals) if vals else 0.0
-        sd = math.sqrt(sum((x-mu)**2 for x in vals)/len(vals)) or 1.0
-        return {j:(x-mu)/sd for x,j in lst}
-
-    L = zscore(lex_scores); V = zscore(vec_scores)
-    alpha = 0.6
-    blend = [(alpha*L.get(i,0.0) + (1-alpha)*V.get(i,0.0), i) for i in range(len(docs))]
-    blend.sort(reverse=True)
-    return [docs[i] for _, i in blend[:top_k]]
-
-# ---------- SSE helpers ----------
-def sse_event(event: Optional[str], data: str) -> str:
-    if event:
-        return f"event: {event}\n" + "\n".join(f"data: {ln}" for ln in data.splitlines()) + "\n\n"
-    return "\n".join(f"data: {ln}" for ln in data.splitlines()) + "\n\n"
-
-def sse_headers_for_origin(origin: Optional[str]) -> Dict[str,str]:
-    h = {"Cache-Control":"no-cache","Connection":"keep-alive","X-Accel-Buffering":"no"}
-    if origin and (origin in ALLOWED_ORIGINS or "*" in ALLOWED_ORIGINS):
-        h["Access-Control-Allow-Origin"] = origin if origin in ALLOWED_ORIGINS else "*"
-        h["Access-Control-Allow-Credentials"] = "true"
-        h["Access-Control-Expose-Headers"] = "*"
-    return h
-
-# ---------- 7-step flow + strict quote policy ----------
-SYSTEM_BASE = """
-You are Fight Chaplain — a calm, concise, spiritually grounded guide for combat sports athletes.
-Unisex language only. Do NOT be a therapist or a generic chatbot.
-
-ALWAYS FOLLOW THIS FLOW:
-1) Begin by acknowledging the fighter’s emotional/spiritual state in warrior-aware language.
-2) Briefly infer emotional tone + readiness (internally) and adapt your guidance.
-3) Offer a short faith-based or reflective message (perseverance, failure, redemption).
-4) Track conversation volume + emotional content.
-5) If thresholds trip (keywords or sustained distress), escalate appropriately.
-6) If need exceeds spiritual scope, suggest mental-health referral (e.g., BetterHelp). Otherwise, prefer referral to a faith leader.
-7) Close with either a gentle next question OR an offer to connect them with a faith leader of their denomination.
-
-CRITICAL QUOTE POLICY:
-- You MUST NOT quote or cite any scripture unless explicit RETRIEVED PASSAGES are provided THIS TURN.
-- If no retrieval is provided, speak in universal themes; invite the user to let you pull an exact passage.
-- If the user’s faith is unknown, do not assume or name a tradition; ask gently.
-- When retrieval IS provided, quote ONE short line verbatim and attribute naturally with an em dash (— Book C:V or tradition label).
-""".strip()
-
-CRISIS_KEYWORDS = {
-    "suicide","kill myself","end it","self harm","hopeless","worthless","no way out",
-    "panic attack","can’t breathe","cant breathe","severe anxiety","despair","give up"
-}
-DISTRESS_KEYWORDS = {
-    "scared","afraid","panic","anxious","nervous","broken","alone","grief","grieving",
-    "lost","depressed","overwhelmed","injury","pain","nightmare","doubt","shame","anger"
-}
-
-class _ChaplainState:
-    __slots__ = ("turns","distress_hits","crisis_hits","escalate","faith_pref")
-    def __init__(self) -> None:
-        self.turns = 0
-        self.distress_hits = 0
-        self.crisis_hits = 0
-        self.escalate = "none"  # "none" | "watch" | "refer-faith" | "refer-mental-health"
-        self.faith_pref = ""
-
-def _get_cs(s: SessionState) -> _ChaplainState:
-    if not hasattr(s, "_chap"): setattr(s, "_chap", _ChaplainState())
-    return getattr(s, "_chap")
-
-def update_session_metrics(user_text: str, s: SessionState) -> None:
-    cs = _get_cs(s)
-    cs.turns += 1
-    low = f" {user_text.lower()} "
-    d = sum(1 for k in DISTRESS_KEYWORDS if f" {k} " in low)
-    c = sum(1 for k in CRISIS_KEYWORDS   if f" {k} " in low)
-    cs.distress_hits += d
-    cs.crisis_hits   += c
-    if cs.crisis_hits > 0:
-        cs.escalate = "refer-mental-health"
-    elif cs.distress_hits >= 3 or cs.turns >= 12:
-        cs.escalate = "refer-faith"
-    elif d > 0:
-        cs.escalate = "watch"
-    else:
-        cs.escalate = "none"
-    cs.faith_pref = (s.faith or "").title() if getattr(s, "faith", None) else ""
-
-def system_message(s: SessionState, *, quote_allowed: bool, faith_known: bool) -> Dict[str,str]:
-    base = SYSTEM_BASE
-    if s.rollup:
-        base += "\n\nSESSION_SUMMARY: " + s.rollup
-    cs = _get_cs(s)
-    status = {
-        "turns": cs.turns,
-        "distress_hits": cs.distress_hits,
-        "crisis_hits": cs.crisis_hits,
-        "escalate": cs.escalate,
-        "faith_pref": cs.faith_pref or (s.faith or ""),
-    }
-    base += "\n\nSESSION_STATUS: " + json.dumps(status, ensure_ascii=False)
-    base += f"\n\nTURN_LIMITS: quote_allowed={str(quote_allowed).lower()}, faith_known={str(faith_known).lower()}"
-    base += (
-        "\n\nCLOSER_POLICY: Always end with either a gentle next question "
-        "OR an offer to connect them with a faith leader of their denomination."
+    
+    session_status = (
+        f"SESSION STATUS: Escalation={s._chap.escalate}. Turns={s._chap.turns}. "
+        f"Faith set={s.faith or 'None'}. Quote is allowed={quote_allowed}."
     )
-    return {"role":"system","content":base}
+    
+    full_prompt = (
+        SYSTEM_BASE_FLOW + "\n"
+        "--- CONTEXT ---\n"
+        f"SESSION HISTORY ROLLUP (If available, summarize user intent): {s.rollup or 'N/A'}\n"
+        f"CURRENT SESSION STATUS: {session_status}\n"
+        f"RAG RULE: {rag_instruction}\n"
+        f"{retrieval_ctx or 'No passages retrieved this turn. The LLM must not quote.'}\n"
+    )
 
-def apply_referral_footer(final_text: str, s: SessionState) -> str:
-    cs = _get_cs(s)
-    footer = ""
-    if cs.escalate == "refer-mental-health":
-        footer = (
-            "\n\nIf you’re in immediate danger, contact local emergency services. "
-            "For professional counseling, BetterHelp can connect you with a licensed counselor. "
-            "I can also connect you with a faith leader if you’d like."
-        )
-    elif cs.escalate == "refer-faith":
-        footer = (
-            "\n\nIf you’d like, I can connect you with a faith leader from your denomination for personal support."
-        )
-    return (final_text or "").rstrip() + footer
+    return {"role": "system", "content": full_prompt}
 
-ONBOARD_GREETING = (
-    "Hello! It’s great to hear from you. How are you feeling today, both in and out of the ring? "
-    "Do you practice within a specific faith tradition?"
-)
+# --- 6. SHARED CHAT LOGIC (DRY principle) ---
 
-# ---------- FastAPI + CORS ----------
-app = FastAPI()
-
-ALLOWED_ORIGINS = {
-    "https://dturnover.github.io",
-    "http://localhost:3000","http://127.0.0.1:3000",
-    "http://localhost:5500","http://127.0.0.1:5500",
-}
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=list(ALLOWED_ORIGINS),
-    allow_credentials=True,
-    allow_methods=["GET","POST","OPTIONS"],
-    allow_headers=["*"],
-    expose_headers=["*"],
-    max_age=600,
-)
-
-@app.middleware("http")
-async def cors_exact_origin(request: Request, call_next):
-    origin = request.headers.get("origin", "")
-    resp = await call_next(request)
-    if origin in ALLOWED_ORIGINS:
-        resp.headers["Access-Control-Allow-Origin"] = origin
-        resp.headers["Vary"] = "Origin"
-        resp.headers["Access-Control-Allow-Credentials"] = "true"
-        resp.headers["Access-Control-Methods"] = "GET, POST, OPTIONS"
-        req_hdrs = request.headers.get("access-control-request-headers")
-        resp.headers["Access-Control-Allow-Headers"] = req_hdrs or "*"
-        resp.headers["Access-Control-Expose-Headers"] = "*"
-    return resp
-
-@app.options("/{rest_of_path:path}")
-def options_preflight(request: Request, rest_of_path: str):
-    origin = request.headers.get("origin", "")
-    headers = {}
-    if origin in ALLOWED_ORIGINS:
-        headers = {
-            "Access-Control-Allow-Origin": origin,
-            "Vary": "Origin",
-            "Access-Control-Allow-Credentials": "true",
-            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-            "Access-Control-Allow-Headers": request.headers.get("access-control-request-headers") or "*",
-            "Access-Control-Max-Age": "600",
-        }
-    return PlainTextResponse("OK", headers=headers)
-
-# ---------- Small helpers ----------
-def _maybe_rollup(s: SessionState) -> None:
-    if len(s.history) >= 24 and not s.rollup:
-        user_lines = [m["content"] for m in s.history if m["role"] == "user"]
-        if user_lines:
-            s.rollup = ("Themes: " + "; ".join(user_lines[-6:]))[:500]
-
-# ---------- Routes ----------
-@app.get("/")
-def root(): return PlainTextResponse("ok")
-
-@app.get("/health")
-def health(): return PlainTextResponse("OK")
-
-@app.get("/diag_rag")
-def diag(): return {"ok": True, "corpora": corpus_counts()}
-
-# ---- Non-stream JSON chat ----
-@app.post("/chat")
-async def chat(request: Request):
-    body = await request.json()
-    msg = (body.get("message") or "").strip()
-
-    base = Response()
-    sid, s = get_or_create_sid(request, base)
-
-    # onboarding on first user turn
-    if len(s.history) <= 1 and msg:
-        s.history.append({"role":"assistant","content":ONBOARD_GREETING})
-
+def handle_chat_turn(s: SessionState, msg: str) -> Tuple[List[Dict[str,str]], Optional[Dict[str,str]]]:
+    """
+    Handles common chat logic: history update, RAG/System message construction.
+    Returns (messages_for_llm, source_info_for_response)
+    """
+    # 1. Update Session and History
     try_set_faith(msg, s)
     update_session_metrics(msg, s)
+    
+    # Append user message for the LLM call
     s.history.append({"role":"user","content":msg})
+    
+    # Simple history trimming to keep the context window manageable
+    # We keep the system prompt + last 39 messages
     if len(s.history) > 40:
         s.history = s.history[:1] + s.history[-39:]
+        
+    messages = s.history[1:] # Exclude the placeholder system message
+
+    # 2. RAG Check (Step 2)
+    quote_allowed, retrieval_ctx, source_info = False, None, None
 
     if wants_retrieval(msg):
-        corp = detect_corpus(msg, s)
-        hits = hybrid_search(msg, corp, top_k=6)
+        # NEW LOGIC: Check if RAG is allowed given the memory constraint
+        corp = allowed_corpus_for(msg, s) 
+        
+        if corp and corp in CORPUS_FILES: # Only run RAG if a corpus is allowed and found
+            hits = hybrid_search(msg, corp, top_k=6)
+        else:
+            hits = []
+
         if hits:
             top = hits[0]
             clean_text = clean_passage(top.get("text",""))
             pretty_ref = natural_ref(top)
-
-            interleave_rule = (
-                "QUOTE STYLE:\n"
-                "- Use curly quotes around ONE short quoted line, then an em dash and the natural ref, e.g., "
-                "“He maketh my feet like hinds’ feet.” — 2 Samuel 22:34\n"
-                "- Surround the quote with 1–2 sentences of guidance BEFORE and AFTER. Do not quote twice."
-            )
-            ctx = (
+            
+            retrieval_ctx = (
                 "RETRIEVED PASSAGES (you may quote EXACTLY ONE short line verbatim; then weave brief guidance around it):\n"
                 f"- {pretty_ref} :: {clean_text}"
             )
+            quote_allowed = True
+            source_info = {"ref": pretty_ref, "source": top.get("source","")}
 
-            sys_msg = system_message(s, quote_allowed=True, faith_known=bool(s.faith))
-            sys_msg["content"] += "\n\n" + interleave_rule + "\n" + ctx
-            messages = [sys_msg] + s.history[1:]
+    # 3. Build System Message
+    sys_msg = system_message(s, quote_allowed=quote_allowed, faith_known=bool(s.faith), retrieval_ctx=retrieval_ctx)
+    
+    # Prepend the dynamic system message
+    messages = [sys_msg] + messages
+    
+    return messages, source_info
 
-            out = call_openai(messages, stream=False)
-            reply = out if isinstance(out, str) else "".join(list(out))
-            reply = apply_referral_footer(reply, s)
-            s.history.append({"role":"assistant","content":reply})
-            _maybe_rollup(s)
-            return JSONResponse(
-                {"response": reply, "sid": sid,
-                 "sources":[{"ref": pretty_ref, "source": top.get("source","")}]},
-                headers={"X-Session-Id": sid}
-            )
+# --- 7. FASTAPI APPLICATION SETUP ---
 
-    # no RAG → quotes forbidden this turn
-    out = call_openai([system_message(s, quote_allowed=False, faith_known=bool(s.faith))] + s.history[1:], stream=False)
-    reply = out if isinstance(out, str) else "".join(list(out))
-    reply = apply_referral_footer(reply, s)
-    s.history.append({"role":"assistant","content":reply})
-    _maybe_rollup(s)
-    return JSONResponse({"response": reply, "sid": sid, "sources": []}, headers={"X-Session-Id": sid})
+app = FastAPI(title="Fight Chaplain Backend")
 
-# ---- Streaming SSE chat (no cookies used here) ----
+# Custom Middleware for CORS and Cookie Handling
+class CORSCookieMiddleware(BaseHTTPMiddleware):
+    """Handles setting necessary CORS headers and ensures cookies are available."""
+    async def dispatch(self, request: Request, call_next):
+        # --- Preflight/Response setup ---
+        response = await call_next(request)
+        
+        origin = request.headers.get("origin")
+        if origin:
+            response.headers["Access-Control-Allow-Origin"] = origin
+        else:
+             response.headers["Access-Control-Allow-Origin"] = "*" # Fallback for non-browser clients
+
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Session-Id"
+        response.headers["Vary"] = "Origin" # Essential when dynamically setting CORS Origin
+
+        # --- Initial Cookie Setting (if it's a new session) ---
+        if 'sid' not in request.cookies:
+            # We need a temporary response to set the cookie before returning
+            temp_response = Response()
+            _, session_state = get_or_create_sid(request, temp_response)
+            
+            # Transfer cookies from the temp response to the final response
+            if 'set-cookie' in temp_response.headers:
+                if 'set-cookie' in response.headers:
+                    response.headers.append('set-cookie', temp_response.headers['set-cookie'])
+                else:
+                    response.headers['set-cookie'] = temp_response.headers['set-cookie']
+                    
+        return response
+
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(CORSCookieMiddleware) # Use custom middleware for cookie/CORS interaction
+
+@app.get("/diag_rag")
+async def diag_rag():
+    """Diagnostic endpoint to check corpus file availability and size."""
+    return {
+        "status": "ok",
+        "has_openai": _HAS_OPENAI,
+        "openai_model": OPENAI_MODEL,
+        "rag_dir_candidates": [str(p) for p in _candidate_index_dirs()],
+        "available_corpora": {k: str(v) for k, v in CORPUS_FILES.items()},
+        "corpus_line_counts": corpus_counts(),
+        "memory_model": "On-Disk Streaming RAG (Low RAM usage)",
+    }
+
+
+# --- 8. CHAT ROUTES ---
+
+@app.post("/chat")
+async def chat_non_streaming(request: Request, response: Response):
+    """Standard POST route for non-streaming chat responses."""
+    
+    sid, s = get_or_create_sid(request, response)
+    
+    try:
+        data = await request.json()
+        msg = data.get("message", "").strip()
+    except:
+        raise HTTPException(status_code=400, detail="Invalid JSON format")
+
+    if not msg:
+        return JSONResponse({"message": "No message provided.", "sources": []})
+
+    messages, source_info = handle_chat_turn(s, msg)
+    
+    # Non-streaming call
+    assistant_out = call_openai(messages, stream=False)
+    
+    # 5. Final Step: Apply referral and save history
+    final_response = apply_referral_footer(assistant_out, s._chap.escalate)
+    s.history.append({"role": "assistant", "content": final_response})
+    
+    return JSONResponse({
+        "message": final_response,
+        "sources": source_info,
+        "session_id": sid,
+        "faith": s.faith,
+    })
+
 @app.get("/chat_sse")
-async def chat_sse(request: Request, q: str, sid: Optional[str] = None):
-    if sid and sid in SESSIONS:
-        sid2, s = sid, SESSIONS[sid]
-    else:
-        sid2 = sid or uuid.uuid4().hex
-        s = SESSIONS.get(sid2) or SessionState()
-        SESSIONS[sid2] = s
+async def chat_streaming(request: Request, response: Response):
+    """GET route for Server-Sent Events (SSE) streaming chat responses."""
+    
+    # 1. Get Session & Handle Setup
+    sid, s = get_or_create_sid(request, response)
+    msg = request.query_params.get("message", "").strip()
 
-    if len(s.history) <= 1 and q:
-        s.history.append({"role":"assistant","content":ONBOARD_GREETING})
+    if not msg:
+        # Return a simple event stream signaling no content
+        return StreamingResponse(
+            content="event: error\ndata: No message provided\n\n",
+            media_type="text/event-stream"
+        )
+        
+    messages, source_info = handle_chat_turn(s, msg)
 
-    try_set_faith(q, s)
-    update_session_metrics(q, s)
-    origin = request.headers.get("origin")
-
+    # 2. Asynchronously Generate Stream
     async def agen():
-        yield b": connected\n\n"
-        yield b"event: ping\ndata: hi\n\n"
-        last_hb = asyncio.get_event_loop().time()
+        assistant_out = ""
+        last_yield = 0
+        chunk_min_size = 8
+        
+        # 2a. Send initial session/source information (event: start)
+        yield f"event: start\ndata: {json.dumps({'session_id': sid, 'faith': s.faith or 'none'})}\n\n"
 
-        def emit(txt: str) -> bytes:
-            return ("data: " + json.dumps({"text": txt}) + "\n\n").encode("utf-8")
+        # 2b. Send source info if RAG was used (event: sources)
+        if source_info:
+            yield f"event: sources\ndata: {json.dumps(source_info)}\n\n"
+            
+        # 3. Call OpenAI and Stream Text (event: message)
+        llm_stream = call_openai(messages, stream=True)
+        if llm_stream:
+            for chunk in llm_stream:
+                if not isinstance(chunk, str): continue
+                
+                assistant_out += chunk
+                
+                # Check for chunking conditions
+                if (len(assistant_out) - last_yield >= chunk_min_size) or ('\n' in assistant_out[last_yield:]):
+                    # Yield the new text chunk
+                    new_chunk = assistant_out[last_yield:]
+                    yield f"event: message\ndata: {json.dumps({'text': new_chunk})}\n\n"
+                    last_yield = len(assistant_out)
 
-        try:
-            # default: no quotes allowed unless RAG hits
-            sys_msg = system_message(s, quote_allowed=False, faith_known=bool(s.faith))
-            messages = [sys_msg] + s.history[1:] + [{"role":"user","content":q}]
+                await asyncio.sleep(0.001) # Small pause to allow context switching
+        
+        # 4. Final text push (in case the last chunk was too small)
+        if len(assistant_out) > last_yield:
+             new_chunk = assistant_out[last_yield:]
+             yield f"event: message\ndata: {json.dumps({'text': new_chunk})}\n\n"
+        
+        # 5. Final Step: Apply referral footer (event: footer)
+        final_response = apply_referral_footer(assistant_out, s._chap.escalate)
+        footer_text = final_response[len(assistant_out):] # Only the added referral text
+        
+        if footer_text.strip():
+            yield f"event: footer\ndata: {json.dumps({'text': footer_text})}\n\n"
+        
+        # 6. Save final response to history
+        s.history.append({"role": "assistant", "content": final_response})
+        
+        # 7. Close stream
+        yield "event: end\ndata: {}\n\n"
 
-            if wants_retrieval(q):
-                corp = detect_corpus(q, s)
-                hits = hybrid_search(q, corp, top_k=6)
-                if hits:
-                    top = hits[0]
-                    clean_text = clean_passage(top.get("text",""))
-                    pretty_ref = natural_ref(top)
-
-                    interleave_rule = (
-                        "QUOTE STYLE:\n"
-                        "- Use curly quotes around ONE short quoted line, then an em dash and the natural ref, e.g., "
-                        "“He maketh my feet like hinds’ feet.” — 2 Samuel 22:34\n"
-                        "- Surround the quote with 1–2 sentences of guidance BEFORE and AFTER. Do not quote twice."
-                    )
-                    ctx = (
-                        "RETRIEVED PASSAGES (you may quote EXACTLY ONE short line verbatim; then weave brief guidance around it):\n"
-                        f"- {pretty_ref} :: {clean_text}"
-                    )
-
-                    sys_msg = system_message(s, quote_allowed=True, faith_known=bool(s.faith))
-                    sys_msg["content"] += "\n\n" + interleave_rule + "\n" + ctx
-                    messages = [sys_msg] + s.history[1:] + [{"role":"user","content":q}]
-
-            # stream model guidance
-            stream = call_openai(messages, stream=True)
-            assistant_out, pending = "", ""
-            for piece in stream:  # type: ignore
-                if not piece: continue
-                pending += piece
-                if len(pending) >= 8 or "\n" in pending:
-                    yield emit(pending); assistant_out += pending; pending = ""
-                now = asyncio.get_event_loop().time()
-                if (now - last_hb) > 5: yield b": hb\n\n"; last_hb = now
-                await asyncio.sleep(0)
-            if pending: yield emit(pending); assistant_out += pending
-
-            # footer (if any)
-            footer = apply_referral_footer("", s).strip()
-            if footer: yield emit(footer)
-
-            # persist
-            stored = (assistant_out.strip() + ("\n\n" + footer if footer else "")).strip()
-            s.history.append({"role":"user","content":q})
-            s.history.append({"role":"assistant","content":stored})
-            _maybe_rollup(s)
-            yield ("event: done\ndata: " + json.dumps({"sid": sid2}) + "\n\n").encode("utf-8")
-
-        except Exception as e:
-            err = {"error": str(e)}
-            yield ("event: error\ndata: " + json.dumps(err) + "\n\n").encode("utf-8")
-            yield b": end\n\n"
-
-    hdrs = {**sse_headers_for_origin(origin)}
-    hdrs["Cache-Control"] = "no-cache"
-    hdrs["X-Accel-Buffering"] = "no"
-    return StreamingResponse(agen(), media_type="text/event-stream; charset=utf-8", headers=hdrs)
-
-# ---- Infra sanity streams ----
-@app.get("/sse_echo")
-async def sse_echo():
-    async def agen():
-        i = 0
-        while True:
-            await asyncio.sleep(0.4); i += 1
-            yield f"data: echo {i}\n\n".encode("utf-8")
-            if i % 12 == 0: yield b": hb\n\n"
-    return StreamingResponse(agen(), media_type="text/event-stream; charset=utf-8")
-
-@app.get("/sse_test")
-async def sse_test():
-    async def agen():
-        yield b": connected\n\n"
-        for i in range(1, 6):
-            await asyncio.sleep(0.4)
-            yield f"data: tick {i}\n\n".encode("utf-8")
-        yield b"event: done\ndata: ok\n\n"
-    return StreamingResponse(agen(), media_type="text/event-stream; charset=utf-8")
-
-@app.get("/chat_sse_get")
-def chat_sse_get():
-    def gen():
-        yield ": connected\n\n"
-        yield sse_event(None, "This is a GET stream endpoint.")
-    return StreamingResponse(gen(), media_type="text/event-stream; charset=utf-8")
+    # Set appropriate headers for SSE
+    return StreamingResponse(agen(), media_type="text/event-stream")
