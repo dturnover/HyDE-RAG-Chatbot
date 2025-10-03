@@ -247,10 +247,27 @@ def _normalize_output_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         })
     return out_rows
 
+def _edit_distance(s1, s2):
+    """Simple, non-library Levenshtein implementation for typo checking."""
+    # Source: https://en.wikipedia.org/wiki/Levenshtein_distance#Iterative_with_full_matrix
+    if len(s1) > len(s2):
+        s1, s2 = s2, s1
+    distances = range(len(s1) + 1)
+    for i2, c2 in enumerate(s2):
+        new_distances = [i2 + 1]
+        for i1, c1 in enumerate(s1):
+            if c1 == c2:
+                new_distances.append(distances[i1])
+            else:
+                new_distances.append(1 + min((distances[i1], distances[i1+1], new_distances[-1])))
+        distances = new_distances
+    return distances[-1]
+
+
 def hybrid_search(query: str, corpus_name: str, top_k: int = 6) -> List[Dict[str, Any]]:
     """
-    On-disk streaming Hybrid (Jaccard + Cosine) search.
-    This runs two passes over the file on disk, keeping only top-K candidates in RAM.
+    On-disk streaming Hybrid (Jaccard + Cosine) search with Dual-Search Fallback.
+    Consolidates candidates from both lexical and vector searches for a robust blend.
     """
     path = CORPUS_FILES.get(corpus_name)
     if not path or not path.exists():
@@ -261,83 +278,87 @@ def hybrid_search(query: str, corpus_name: str, top_k: int = 6) -> List[Dict[str
     
     OVER = max(top_k * 8, 50) # Over-fetch window size
     
-    # --- PASS 1: lexical and preliminary candidate selection ---
-    lex_stat = _Stat()
-    lex_heap: list[tuple[float, int, Dict[str, Any]]] = []
+    # --- Data Structures to Store Results from Two Passes ---
+    all_candidates: Dict[int, Dict[str, Any]] = {} # Master collection of all potential results
+    lex_scores: Dict[int, float] = {} # Jaccard score
+    vec_scores: Dict[int, float] = {} # Cosine score
     
+    # --- Statistics for Normalization ---
+    lex_stat = _Stat()
+    vec_stat = _Stat()
+    
+    # --- Top Candidate Heaps (used for final pool selection) ---
+    lex_heap: list[tuple[float, int]] = [] # (Jaccard, index)
+    vec_heap: list[tuple[float, int]] = [] # (Cosine, index)
+    
+    # --- Streaming Pass (Consolidated) ---
     for i, row in enumerate(_iter_jsonl_rows(path)):
+        # 1. Lexical Scoring (Jaccard)
         txt = row.get("text") or ""
-        if not txt: continue
         js = jaccard(q_tokens, tokenize(txt))
         lex_stat.push(js)
         
         if js > 0.0:
+            lex_scores[i] = js
+            all_candidates[i] = row
             if len(lex_heap) < OVER:
-                heapq.heappush(lex_heap, (js, i, row))
+                heapq.heappush(lex_heap, (js, i))
             elif js > lex_heap[0][0]:
-                heapq.heapreplace(lex_heap, (js, i, row))
-
-    if lex_stat.n == 0:
-        return []
-
-    # Normalize lexical scores for the kept pool
-    mean_L, std_L = lex_stat.mean, (lex_stat.std or 1.0)
-    candidates = {(j, idx): row for (j, idx, row) in lex_heap} # {(score, index): row}
-    Lz = {(j, idx): (j - mean_L) / std_L for (j, idx, _row) in lex_heap}
-    
-    # Fallback to lexical-only if no embeddings are available
-    if not q_emb:
-        blend = []
-        alpha = 0.9
-        for (j, idx), row in candidates.items():
-            blend.append( (alpha*Lz[(j, idx)] + (1-alpha)*0.0, idx, row) )
-        blend.sort(reverse=True, key=lambda t: t[0])
-        return _normalize_output_rows([r for _,__,r in blend[:top_k]])
-
-    # --- PASS 2: vector stats and second round candidate selection ---
-    vec_stat = _Stat()
-    vec_heap: list[tuple[float, int, Dict[str, Any]]] = []
-    
-    for i, row in enumerate(_iter_jsonl_rows(path)):
+                heapq.heapreplace(lex_heap, (js, i))
+                
+        # 2. Vector Scoring (Cosine)
         e = row.get("embedding")
-        if not isinstance(e, list): continue
-        
-        s = cos(q_emb, e)
-        vec_stat.push(s)
+        if isinstance(e, list) and q_emb:
+            s = cos(q_emb, e)
+            vec_stat.push(s)
+            
+            vec_scores[i] = s
+            all_candidates[i] = row # Add to master if not already added by lexical
+            
+            if len(vec_heap) < OVER:
+                heapq.heappush(vec_heap, (s, i))
+            elif s > vec_heap[0][0]:
+                heapq.heapreplace(vec_heap, (s, i))
 
-        if len(vec_heap) < OVER:
-            heapq.heappush(vec_heap, (s, i, row))
-        elif s > vec_heap[0][0]:
-            heapq.heapreplace(vec_heap, (s, i, row))
-
+    # --- Consolidation and Normalization ---
+    
+    # Identify unique indices selected by either lexical or vector search (the pool to score)
+    top_indices = set(idx for _, idx in lex_heap) | set(idx for _, idx in vec_heap)
+    
+    if not top_indices:
+        return [] # Both searches failed entirely
+    
+    # Global stats for Z-scoring
+    mean_L, std_L = lex_stat.mean, (lex_stat.std or 1.0)
     mean_V, std_V = vec_stat.mean, (vec_stat.std or 1.0)
     
-    # Build vector z map
+    # 1. Calculate Z-scores for the consolidated pool
+    Lz: Dict[int, float] = {}
     Vz: Dict[int, float] = {}
-    for s, i, _row in vec_heap:
-        Vz[i] = (s - mean_V) / std_V
-
-    # Backfill Vz for lexical-strong rows that weren't vector-strong enough to be in vec_heap
-    lex_indices = {idx for (_, idx) in candidates.keys()}
-    for idx in lex_indices:
-        if idx not in Vz:
-            # FIX: Critical Bug. Was incorrectly using std_L. Must use std_V to normalize a vector score.
-            Vz[idx] = (0.0 - mean_V) / std_V # Assign neutral/low vector score
+    
+    for idx in top_indices:
+        # Use mean if score is missing (meaning it wasn't in the top OVER candidates of that type)
+        js = lex_scores.get(idx, mean_L) 
+        cs = vec_scores.get(idx, mean_V)
+        
+        # Calculate Z-scores:
+        Lz[idx] = (js - mean_L) / std_L
+        Vz[idx] = (cs - mean_V) / std_V
 
     # --- BLEND ---
-    # MODIFIED: Increased alpha from 0.6 to 0.8 to heavily favor lexical (keyword) match, 
-    # which is crucial for reliably retrieving verses based on distress words.
+    # Alpha = 0.8 heavily favors lexical (keyword) match due to noisy streaming statistics.
     alpha = 0.8 
     blended: List[tuple[float, int, Dict[str, Any]]] = []
     
-    for (j_score, idx), row in candidates.items():
-        lz = Lz[(j_score, idx)]
-        vz = Vz.get(idx, 0.0)
+    for idx in top_indices:
+        lz = Lz[idx]
+        vz = Vz[idx]
         sc = alpha*lz + (1 - alpha)*vz
-        blended.append((sc, idx, row))
+        blended.append((sc, idx, all_candidates[idx]))
         
     blended.sort(reverse=True, key=lambda t: t[0])
     
+    # Return the top K candidates
     return _normalize_output_rows([r for _, _, r in blended[:top_k]])
 
 # --- 5. CHAPLAIN AI LOGIC & STATE UPDATE ---
@@ -376,15 +397,23 @@ FAITH_KEYWORDS = {
 BIG_CORPORA = {"bible_nrsv", "tanakh", "bible_asv"}
 
 def try_set_faith(msg: str, s: SessionState) -> None:
-    """Sets the session faith preference if a keyword is found."""
+    """Sets the session faith preference if a keyword is found (now includes typo check)."""
     m = msg.lower()
-    # FIX: Do NOT return if s.faith is already set. Allow user to change faith.
-    # if s.faith: return 
+    m_tokens = tokenize(msg)
     
     for k, corp in FAITH_KEYWORDS.items():
+        # 1. Check for perfect match (fastest)
         if f" {k} " in f" {m} " or m.startswith(k) or m.endswith(k):
             s.faith = corp
             return
+            
+        # 2. Check for close match on individual tokens (typo handling)
+        for token in m_tokens:
+            # Only check if token is close to a faith keyword length for efficiency
+            if abs(len(token) - len(k)) <= 2: 
+                if _edit_distance(token, k) <= 1: # Allow 1 typo (e.g., cathulic -> catholic)
+                    s.faith = corp
+                    return
 
 def detect_corpus(msg: str, s: SessionState) -> str:
     """Determines the most appropriate corpus based on session state or message keywords."""
