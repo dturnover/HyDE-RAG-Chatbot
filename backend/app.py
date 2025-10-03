@@ -321,7 +321,7 @@ def hybrid_search(query: str, corpus_name: str, top_k: int = 6) -> List[Dict[str
     lex_indices = {idx for (_, idx) in candidates.keys()}
     for idx in lex_indices:
         if idx not in Vz:
-            Vz[idx] = (0.0 - mean_V) / std_V # Assign neutral/low vector score
+            Vz[idx] = (0.0 - mean_V) / std_L # Assign neutral/low vector score
 
     # --- BLEND ---
     alpha = 0.6 # Weight favoring lexical score
@@ -344,11 +344,11 @@ ONBOARD_GREETING = "I am the Fight Chaplain. My role is to offer spiritual guida
 SYSTEM_BASE_FLOW = """
 You are the Fight Chaplain. You are a highly professional, empathetic, and strictly non-denominational spiritual guide.
 Your entire purpose is to support a person navigating stressful situations or seeking spiritual insight.
-You must adhere to the following 7-step flow in every response:
+You must adhere to the following 7-step flow in every response (keep responses **concise and direct**):
 1. **Acknowledge and Validate:** Start by recognizing the user's emotion or need with empathy.
 2. **Determine RAG:** Check if a quote is provided in the context.
 3. **If RAG is available (Quote Allowed):** Weave the provided scripture, quote, or passage *seamlessly* and briefly into your response. Do not quote more than one short line verbatim. The entire reply must be centered on the retrieved text.
-4. **If RAG is NOT available (No Quote Allowed):** DO NOT under any circumstances invent or quote scripture, verses, or religious passages. Instead, provide empathetic, non-denominational, practical, and supportive guidance only. You must state your inability to quote if the user has not specified their faith.
+4. **If RAG is NOT available (No Quote Allowed):** DO NOT under any circumstances invent or quote scripture, verses, or religious passages. Instead, follow the specific RAG RULE below.
 5. **Guidance and Context:** Provide brief, supportive, and action-oriented guidance based on the context.
 6. **Referral Check:** If the session status demands it, append the mandatory referral message (either faith leader or mental health).
 7. **Invite Continuation:** End with an open-ended question to encourage the user to continue the conversation.
@@ -483,13 +483,24 @@ def apply_referral_footer(text: str, status: str) -> str:
 def system_message(s: SessionState, quote_allowed: bool, faith_known: bool, retrieval_ctx: Optional[str]) -> Dict[str, str]:
     """Constructs the LLM system message with all context and rules."""
     
-    # RAG rule enforcement (Crucial step 4)
     rag_instruction = "You are FORBIDDEN from inventing or quoting scripture."
+    
     if quote_allowed:
+        # RAG succeeded, use the quote
         rag_instruction = "You MUST use the provided passage and adhere to step 3."
-    elif not faith_known:
-        # FIX: Added a strong reminder to the LLM to check the session state first.
-        rag_instruction += " You must gently ask the user to specify their faith/tradition to unlock scripture support, or confirm the faith set in the session status."
+    else: # No quote is provided by RAG
+        if faith_known:
+            # FIX: Faith is known but RAG failed to retrieve a quote (e.g., poor vector search results).
+            # The LLM must acknowledge the known faith and provide practical guidance.
+            rag_instruction += (
+                " Your session faith is set to **{s.faith}**. DO NOT claim the user's faith is unknown. "
+                "Since no quote was retrieved this turn, provide only empathetic, practical, and non-denominational guidance (Step 5)."
+            )
+        else:
+            # FIX: Faith is unknown, follow the original instruction.
+            rag_instruction += (
+                " The user's faith is UNKNOWN. You must gently ask the user to specify their faith/tradition to unlock scripture support."
+            )
     
     session_status = (
         f"SESSION STATUS: Escalation={s._chap.escalate}. Turns={s._chap.turns}. "
