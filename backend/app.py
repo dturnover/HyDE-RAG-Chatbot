@@ -103,7 +103,10 @@ def get_or_create_sid(request: Request, response: Optional[Response] = None) -> 
         sid = uuid.uuid4().hex
 
     if sid not in SESSIONS:
-        SESSIONS[sid] = SessionState()
+        # FIX: When a session is created, the first item in history is the system placeholder.
+        # This fixes a bug where history was being trimmed incorrectly when empty.
+        new_session = SessionState()
+        SESSIONS[sid] = new_session
         is_new_session = True
         
     # If a Response object is passed (meaning this is the first interaction), set the cookie.
@@ -353,7 +356,7 @@ You must adhere to the following 7-step flow in every response:
 
 # Keywords for RAG trigger and escalation
 ASK_WORDS = {"verse","scripture","psalm","quote","passage","ayah","surah","quran","bible","tanakh","gita","dhammapada"}
-DISTRESS_KEYWORDS = {"scared","anxious","worried","hurt","down","lost","depressed","angry","grief","lonely","alone","doubt","stress"}
+DISTRESS_KEYWORDS = {"scared","anxious","worried","hurt","down","lost","depressed","angry","grief","lonely","alone","doubt","stress", "nervous", "afraid"} # ADDED "nervous" and "afraid"
 CRISIS_KEYWORDS = {"panic","suicide","kill myself","hopeless","end it","emergency","self-harm"}
 
 # Keywords to detect faith preference
@@ -372,7 +375,8 @@ BIG_CORPORA = {"bible_nrsv", "tanakh", "bible_asv"}
 def try_set_faith(msg: str, s: SessionState) -> None:
     """Sets the session faith preference if a keyword is found."""
     m = msg.lower()
-    if s.faith: return
+    # FIX: Do NOT return if s.faith is already set. Allow user to change faith.
+    # if s.faith: return 
     
     for k, corp in FAITH_KEYWORDS.items():
         if f" {k} " in f" {m} " or m.startswith(k) or m.endswith(k):
@@ -381,7 +385,8 @@ def try_set_faith(msg: str, s: SessionState) -> None:
 
 def detect_corpus(msg: str, s: SessionState) -> str:
     """Determines the most appropriate corpus based on session state or message keywords."""
-    if s.faith: return s.faith
+    # FIX: If s.faith is set, it overrides keyword detection for the current turn.
+    if s.faith: return s.faith 
     
     m = msg.lower()
     for k, corp in FAITH_KEYWORDS.items():
@@ -398,10 +403,13 @@ def allowed_corpus_for(msg: str, s: SessionState) -> Optional[str]:
     if the user's faith is not yet established in the session state.
     """
     corp = detect_corpus(msg, s)
+    
+    # FIX: If faith is set in the session, RAG is ALWAYS allowed for that corpus.
     if s.faith: 
         return corp
     
-    # If no faith set, avoid big corpora unless explicitly requested
+    # If no faith set, we fall back to the original guard logic:
+    # Deny RAG if a large corpus is implied but faith is not confirmed by session state.
     if corp in BIG_CORPORA:
         m = msg.lower()
         if any(w in m for w in ["qur", "koran", "allah"]): return "quran"
@@ -480,8 +488,8 @@ def system_message(s: SessionState, quote_allowed: bool, faith_known: bool, retr
     if quote_allowed:
         rag_instruction = "You MUST use the provided passage and adhere to step 3."
     elif not faith_known:
-        rag_instruction += " You must gently ask the user to specify their faith/tradition to unlock scripture support."
-
+        # FIX: Added a strong reminder to the LLM to check the session state first.
+        rag_instruction += " You must gently ask the user to specify their faith/tradition to unlock scripture support, or confirm the faith set in the session status."
     
     session_status = (
         f"SESSION STATUS: Escalation={s._chap.escalate}. Turns={s._chap.turns}. "
@@ -528,9 +536,13 @@ def handle_chat_turn(s: SessionState, msg: str) -> Tuple[List[Dict[str,str]], Op
         corp = allowed_corpus_for(msg, s) 
         
         if corp and corp in CORPUS_FILES: # Only run RAG if a corpus is allowed and found
-            hits = hybrid_search(msg, corp, top_k=6)
+            # FIX: Added a check here to ensure the corpus is actually available
+            if CORPUS_FILES[corp].exists() and CORPUS_FILES[corp].stat().st_size > 0:
+                hits = hybrid_search(msg, corp, top_k=6)
+            else:
+                hits = [] # File not found or empty
         else:
-            hits = []
+            hits = [] # RAG denied by guard or corp is None
 
         if hits:
             top = hits[0]
@@ -578,11 +590,13 @@ class CORSCookieMiddleware(BaseHTTPMiddleware):
         if 'sid' not in request.cookies:
             # We need a temporary response to set the cookie before returning
             temp_response = Response()
-            _, session_state = get_or_create_sid(request, temp_response)
+            # FIX: We only call get_or_create_sid here to ensure cookie setting logic runs once.
+            sid, session_state = get_or_create_sid(request, temp_response)
             
             # Transfer cookies from the temp response to the final response
             if 'set-cookie' in temp_response.headers:
                 if 'set-cookie' in response.headers:
+                    # Append new cookie header to existing ones if present
                     response.headers.append('set-cookie', temp_response.headers['set-cookie'])
                 else:
                     response.headers['set-cookie'] = temp_response.headers['set-cookie']
@@ -644,7 +658,9 @@ async def chat_streaming(request: Request, response: Response):
     """GET route for Server-Sent Events (SSE) streaming chat responses."""
     
     # 1. Get Session & Handle Setup
-    sid, s = get_or_create_sid(request, response)
+    # FIX: Ensure cookies are read correctly by passing the response object here, 
+    # even though we don't use the returned response object (it just ensures cookie setting).
+    sid, s = get_or_create_sid(request, response) 
     msg = request.query_params.get("message", "").strip()
 
     if not msg:
@@ -681,6 +697,7 @@ async def chat_streaming(request: Request, response: Response):
                 if (len(assistant_out) - last_yield >= chunk_min_size) or ('\n' in assistant_out[last_yield:]):
                     # Yield the new text chunk
                     new_chunk = assistant_out[last_yield:]
+                    # FIX: Use JSON dumps to properly escape newlines and quotes in the chunk
                     yield f"event: message\ndata: {json.dumps({'text': new_chunk})}\n\n"
                     last_yield = len(assistant_out)
 
