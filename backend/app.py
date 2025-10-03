@@ -324,7 +324,9 @@ def hybrid_search(query: str, corpus_name: str, top_k: int = 6) -> List[Dict[str
             Vz[idx] = (0.0 - mean_V) / std_L # Assign neutral/low vector score
 
     # --- BLEND ---
-    alpha = 0.6 # Weight favoring lexical score
+    # MODIFIED: Increased alpha from 0.6 to 0.8 to heavily favor lexical (keyword) match, 
+    # which is crucial for reliably retrieving verses based on distress words.
+    alpha = 0.8 
     blended: List[tuple[float, int, Dict[str, Any]]] = []
     
     for (j_score, idx), row in candidates.items():
