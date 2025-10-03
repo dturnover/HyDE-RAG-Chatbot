@@ -346,9 +346,9 @@ def hybrid_search(query: str, corpus_name: str, top_k: int = 6) -> List[Dict[str
         Vz[idx] = (cs - mean_V) / std_V
 
     # --- BLEND ---
-    # Alpha was 0.8 (80% lexical). Reduced to 0.6 (60% lexical, 40% vector) to improve 
-    # conceptual search (vector) performance for distress keywords like "nervous".
-    alpha = 0.6 
+    # Alpha was 0.8 (80% lexical). Reduced to 0.5 (50% lexical, 50% vector) to give
+    # equal weight to conceptual (vector) search, which is necessary for broad distress terms.
+    alpha = 0.5 
     blended: List[tuple[float, int, Dict[str, Any]]] = []
     
     for idx in top_indices:
