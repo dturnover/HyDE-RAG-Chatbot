@@ -321,7 +321,8 @@ def hybrid_search(query: str, corpus_name: str, top_k: int = 6) -> List[Dict[str
     lex_indices = {idx for (_, idx) in candidates.keys()}
     for idx in lex_indices:
         if idx not in Vz:
-            Vz[idx] = (0.0 - mean_V) / std_L # Assign neutral/low vector score
+            # FIX: Critical Bug. Was incorrectly using std_L. Must use std_V to normalize a vector score.
+            Vz[idx] = (0.0 - mean_V) / std_V # Assign neutral/low vector score
 
     # --- BLEND ---
     # MODIFIED: Increased alpha from 0.6 to 0.8 to heavily favor lexical (keyword) match, 
@@ -495,7 +496,7 @@ def system_message(s: SessionState, quote_allowed: bool, faith_known: bool, retr
             # FIX: Faith is known but RAG failed to retrieve a quote (e.g., poor vector search results).
             # The LLM must acknowledge the known faith and provide practical guidance.
             rag_instruction += (
-                " Your session faith is set to **{s.faith}**. DO NOT claim the user's faith is unknown. "
+                f" Your session faith is set to **{s.faith}**. DO NOT claim the user's faith is unknown. "
                 "Since no quote was retrieved this turn, provide only empathetic, practical, and non-denominational guidance (Step 5)."
             )
         else:
