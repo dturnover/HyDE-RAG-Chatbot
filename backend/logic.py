@@ -21,11 +21,18 @@ def _edit_distance(s1: str, s2: str) -> int:
     return distances[-1]
 
 SYSTEM_BASE_FLOW = """
-You are the Fight Chaplain...
-""" # NOTE: Truncated for brevity, the rest of the file is the same as before.
+You are the Fight Chaplain, a professional, empathetic, and strictly non-denominational spiritual guide.
+Your purpose is to support a person navigating stressful situations. Adhere to this 7-step flow:
+1. Acknowledge and Validate: Recognize the user's emotion with empathy.
+2. Determine RAG: Check if a quote is provided in the context.
+3. If RAG is available: Weave the provided scripture seamlessly and briefly into your response.
+4. If RAG is NOT available: DO NOT invent scripture. Follow the specific RAG RULE below.
+5. Guidance and Context: Provide brief, supportive, action-oriented guidance.
+6. Referral Check: If the session status demands it, append the mandatory referral message.
+7. Invite Continuation: End with an open-ended question.
+"""
 
 def system_message(s: SessionState, quote_allowed: bool, retrieval_ctx: Optional[str]) -> Dict[str, str]:
-    # This function remains the same
     rag_instruction = ""
     if quote_allowed:
         rag_instruction = "You MUST use the provided passage and adhere to step 3."
@@ -51,68 +58,52 @@ def system_message(s: SessionState, quote_allowed: bool, retrieval_ctx: Optional
     )
     return {"role": "system", "content": full_prompt}
 
-# --- ★★★ DEBUG VERSION OF try_set_faith ★★★ ---
 def try_set_faith(msg: str, s: SessionState) -> None:
-    """Sets the session faith using exact match and then typo checking."""
-    print("\n--- [DEBUG] Entering try_set_faith ---")
-    print(f"[DEBUG] Received message: '{msg}'")
+    if s.faith: return # Don't re-check if faith is already set
     m = msg.lower()
-
-    # Step 1: Look for an exact, whole-word match.
-    print("[DEBUG] Starting Step 1: Exact Match Check")
     for keyword, faith_id in config.FAITH_KEYWORDS.items():
-        print(f"[DEBUG]   - Checking keyword: '{keyword}'")
-        match = re.search(r'\b' + re.escape(keyword) + r'\b', m)
-        if match:
-            print(f"[DEBUG]   ✔✔✔ EXACT MATCH FOUND for '{keyword}'!")
+        if re.search(r'\b' + re.escape(keyword) + r'\b', m):
             s.faith = faith_id
-            print(f"[DEBUG] Session faith set to: '{s.faith}'. Exiting function.")
-            print("--- [DEBUG] Leaving try_set_faith ---\n")
             return
-    print("[DEBUG] Step 1 finished. No exact match found.")
-
-    # Step 2: If no exact match, check for typos.
-    print("\n[DEBUG] Starting Step 2: Typo Check")
     msg_tokens = set(re.findall(r'\w+', m))
-    print(f"[DEBUG] Message tokens: {msg_tokens}")
     for keyword, faith_id in config.FAITH_KEYWORDS.items():
         for token in msg_tokens:
-            # Only check for typos on words of similar length
             if abs(len(token) - len(keyword)) <= 2:
-                dist = _edit_distance(token, keyword)
-                print(f"[DEBUG]   - Comparing token:'{token}' to keyword:'{keyword}'. Distance: {dist}")
-                if dist <= 1: # Allow 1 typo
-                    print(f"[DEBUG]   ✔✔✔ TYPO MATCH FOUND! ('{token}' is close to '{keyword}')")
+                if _edit_distance(token, keyword) <= 1:
                     s.faith = faith_id
-                    print(f"[DEBUG] Session faith set to: '{s.faith}'. Exiting function.")
-                    print("--- [DEBUG] Leaving try_set_faith ---\n")
                     return
-    
-    print("[DEBUG] Step 2 finished. No typo match found.")
-    print("[DEBUG] No faith was set in this turn.")
-    print("--- [DEBUG] Leaving try_set_faith ---\n")
 
 def wants_retrieval(msg: str) -> bool:
-    # This function remains the same
     m_lower = msg.lower()
     return any(word in m_lower for word in config.ASK_WORDS | config.DISTRESS_KEYWORDS)
 
+# ★★★ THE FINAL FIX IS HERE ★★★
 def get_rag_context(msg: str, s: SessionState) -> Optional[str]:
-    # This function remains the same
-    if not wants_retrieval(msg):
-        return None
-    if not s.faith:
-        return None
-    hits = rag.hybrid_search(msg, s.faith)
-    if not hits:
-        return None
-    top_hit = hits[0]
-    ref = top_hit.get('ref', 'Unknown Reference')
-    text = re.sub(r'\s+', ' ', top_hit.get('text', '')).strip()
-    return f"RETRIEVED PASSAGE (weave this in seamlessly):\n- {ref} :: {text}"
+    """
+    Performs RAG and formats the context string for the prompt.
+    This will ONLY run if the user's faith is already known AND their message contains a distress keyword.
+    """
+    # Condition 1: Does the user's message contain a trigger word?
+    should_retrieve = wants_retrieval(msg)
+    
+    # Condition 2: Do we already know the user's faith from a PREVIOUS turn?
+    faith_is_set = bool(s.faith)
+
+    # Only perform the search if BOTH conditions are true.
+    if should_retrieve and faith_is_set:
+        hits = rag.hybrid_search(msg, s.faith)
+        if not hits:
+            return None
+
+        top_hit = hits[0]
+        ref = top_hit.get('ref', 'Unknown Reference')
+        text = re.sub(r'\s+', ' ', top_hit.get('text', '')).strip()
+        return f"RETRIEVED PASSAGE (weave this in seamlessly):\n- {ref} :: {text}"
+
+    # If either condition is false, do not attempt to retrieve a quote.
+    return None
 
 def update_session_metrics(msg: str, s: SessionState) -> None:
-    # This function remains the same
     s._chap.turns += 1
     m_lower = msg.lower()
     if any(word in m_lower for word in config.CRISIS_KEYWORDS):
@@ -124,7 +115,6 @@ def update_session_metrics(msg: str, s: SessionState) -> None:
         s._chap.escalate = "refer-faith"
 
 def apply_referral_footer(text: str, status: str) -> str:
-    # This function remains the same
     if status == "refer-mental-health":
         text += "\n\n**Mandatory Referral:** If you are in crisis, please call or text 988 in the US/Canada, or find a local crisis line. Your safety is most important."
     elif status == "refer-faith":
