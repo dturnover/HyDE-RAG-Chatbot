@@ -8,12 +8,22 @@ import config, rag, logic, state
 
 app = FastAPI(title="Fight Chaplain Backend")
 
+# List of allowed domains for CORS
+origins = [
+    "http://localhost",
+    "http://localhost:3000",
+    # Add your deployed frontend's domain here if you have one
+    # e.g., "https://your-frontend-name.onrender.com"
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # Be more specific in production
+    allow_origins=["*"], # Using wildcard for simplicity, can be replaced with `origins` list
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"],
+    # ★★★ THE FIX IS HERE ★★★
+    # Explicitly list the custom header we need the browser to allow.
+    allow_headers=["Content-Type", "X-Session-Id"],
 )
 
 @app.get("/diag")
@@ -40,26 +50,21 @@ async def chat_handler(request: Request, response: Response):
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON payload.")
 
-    # --- Main Logic Flow ---
     logic.try_set_faith(msg, s)
     logic.update_session_metrics(msg, s)
     s.history.append({"role": "user", "content": msg})
 
-    # Trim history to manage context window size
     if len(s.history) > 20:
         s.history = s.history[:1] + s.history[-19:]
 
     retrieval_ctx = logic.get_rag_context(msg, s)
-    
     sys_msg = logic.system_message(s, quote_allowed=bool(retrieval_ctx), retrieval_ctx=retrieval_ctx)
-    
     messages_for_llm = [sys_msg] + s.history[1:]
 
-    # --- Streaming Response ---
     async def stream_generator():
         full_response = ""
         if not rag.client:
-            yield "data: [DEV MODE] OpenAI client not configured.\n\n"
+            yield f"data: {json.dumps({'error': 'OpenAI client not configured.'})}\n\n"
             return
             
         try:
@@ -73,13 +78,11 @@ async def chat_handler(request: Request, response: Response):
                 content = chunk.choices[0].delta.content or ""
                 if content:
                     full_response += content
-                    # Use json.dumps to handle special characters correctly in SSE
                     yield f"data: {json.dumps({'text': content})}\n\n"
         except Exception as e:
             yield f"data: {json.dumps({'error': str(e)})}\n\n"
             return
             
-        # Append footer and save final response
         final_response = logic.apply_referral_footer(full_response, s._chap.escalate)
         footer = final_response[len(full_response):]
         if footer:
@@ -92,5 +95,4 @@ async def chat_handler(request: Request, response: Response):
 
 if __name__ == "__main__":
     import uvicorn
-    # To run: uvicorn main:app --reload
     uvicorn.run(app, host="0.0.0.0", port=8000)
