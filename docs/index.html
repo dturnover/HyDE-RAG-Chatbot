@@ -4,7 +4,6 @@
     <meta charset="utf-8"/>
     <title>Fight Chaplain LLM Demo</title>
     <meta name="viewport" content="width=device-width,initial-scale=1"/>
-    <!-- Load Tailwind CSS -->
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
         /* Custom scrollbar styling for better aesthetics */
@@ -35,7 +34,6 @@
             Fight Chaplain Demo
         </h2>
 
-        <!-- Controls Row -->
         <div class="flex flex-wrap items-center gap-3 mb-6">
             <button id="health" class="px-4 py-2 bg-indigo-600 text-white font-medium rounded-lg hover:bg-indigo-700 transition duration-150 shadow-md">
                 Check Backend
@@ -49,28 +47,22 @@
             </button>
         </div>
 
-        <!-- Chat Log -->
         <div id="log" class="border border-gray-300 bg-white rounded-xl p-4 md:p-5 min-h-80 max-h-[60vh] overflow-y-auto mb-6 shadow-inner text-sm">
-            <!-- Log messages will appear here -->
             <div class="text-gray-500 italic">Start by clicking 'Check Backend' or sending a message.</div>
         </div>
 
-        <!-- Input Row -->
         <div class="flex gap-4 items-end">
-            <textarea id="msg" rows="3" placeholder="Type your message... (e.g., I'm feeling stressed. Can you find me a verse from the Bible?)" 
+            <textarea id="msg" rows="3" placeholder="Type your message... (e.g., I'm feeling stressed. Can you find me a verse from the Bible?)"
                       class="flex-grow w-full p-3 border border-gray-300 rounded-lg focus:ring-primary-green focus:border-primary-green transition duration-150 resize-none text-gray-700"></textarea>
             <button id="send" class="h-14 w-20 bg-primary-green text-white font-semibold rounded-lg hover:bg-green-700 transition duration-150 shadow-lg flex items-center justify-center">
                 Send
             </button>
         </div>
-        
     </div>
 
 <script>
-    // NOTE: The API URL must be the exact URL of your deployed Render service.
-    // The URL below is a placeholder from your context.
     const API = "https://llm-api-demo-5qz1.onrender.com";
-    
+
     const log = document.getElementById("log");
     const msgEl = document.getElementById("msg");
     const healthBtn = document.getElementById("health");
@@ -78,185 +70,124 @@
     const sendBtn = document.getElementById("send");
     const streamBox = document.getElementById("stream");
 
-    // We use localStorage for a sticky Session ID (SID) that EventSource can use.
-    const getSID = () => {
-        let sid = localStorage.getItem("sid");
-        if (!sid) { sid = crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2); localStorage.setItem("sid", sid); }
-        return sid;
-    };
-
-    const addLine = (cls, role, text="") => {
+    const addLine = (cls, role, text = "") => {
         const line = document.createElement("div");
         line.className = `line ${cls} py-1`;
-        const r = document.createElement("span"); 
-        r.className = `role font-semibold mr-2 ${cls === 'bot' ? 'text-primary-green' : 'text-indigo-600'}`; 
+        const r = document.createElement("span");
+        r.className = `role font-semibold mr-2 ${cls === 'bot' ? 'text-primary-green' : 'text-indigo-600'}`;
         r.textContent = role + ":";
-        const m = document.createElement("span"); m.className = "msg text-gray-800 whitespace-pre-wrap"; m.textContent = text;
-        line.appendChild(r); line.appendChild(m); log.appendChild(line); log.scrollTop = log.scrollHeight;
+        const m = document.createElement("span");
+        m.className = "msg text-gray-800 whitespace-pre-wrap";
+        m.textContent = text;
+        line.appendChild(r);
+        line.appendChild(m);
+        log.appendChild(line);
+        log.scrollTop = log.scrollHeight;
         return { line, msgSpan: m };
     };
-    
-    const addDbg = (t) => { 
-        const d = document.createElement("div"); 
-        d.className = "line text-xs text-gray-500 italic pt-1 border-t border-gray-100 mt-2"; 
-        d.textContent = `[Debug] ${t}`; 
-        log.appendChild(d); log.scrollTop = log.scrollHeight; 
-    };
 
-    let live = null;
-    const startLive = () => { 
-        const { line, msgSpan } = addLine("bot", "Bot", ""); 
-        const c = document.createElement("span"); c.className = "cursor inline-block w-1.5 h-4 bg-gray-500 align-middle ml-0.5 animate-pulse rounded-sm"; c.textContent = " "; 
-        line.appendChild(c); 
-        live = { line, msgSpan, c, buf: "" }; 
-    };
-    
-    const pushLive = (t) => { 
-        if (!live) startLive(); 
-        live.buf += t; 
-        live.msgSpan.textContent = live.buf; 
-        log.scrollTop = log.scrollHeight; 
-    };
-    
-    const endLive = () => { 
-        if (!live) return; 
-        // Remove the cursor and check for mandatory referral footer
-        if (live.c.parentNode === live.line) {
-            live.line.removeChild(live.c);
-        }
-        
-        // Final check for source info if it was missed in the stream
-        if (live.sourceInfo) {
-            addDbg(`Source: ${live.sourceInfo.ref} (${live.sourceInfo.source})`);
-        }
-        
-        live = null; 
+    const addDbg = (t) => {
+        const d = document.createElement("div");
+        d.className = "line text-xs text-gray-500 italic pt-1 border-t border-gray-100 mt-2";
+        d.textContent = t;
+        log.appendChild(d);
+        log.scrollTop = log.scrollHeight;
     };
 
     healthBtn.onclick = async () => {
-        // FIX 1: Corrected endpoint from /health to /diag_rag
-        try { 
-            const r = await fetch(`${API}/diag_rag`); 
-            const text = await r.text();
-            addDbg(`Backend Status: ${text.trim().substring(0, 100)}...`); 
-        } catch(e){ 
-            addDbg(`Backend Error: ${e?.message||e}. Ensure Render service is running at ${API}`); 
+        // ★★★ FIX 1: Corrected endpoint from /diag_rag to /diag ★★★
+        try {
+            const r = await fetch(`${API}/diag`);
+            const json = await r.json();
+            addDbg(`Backend Status: OK | Model: ${json.openai_model}`);
+        } catch (e) {
+            addDbg(`Backend Error: ${e?.message||e}. Ensure Render service is running at ${API}`);
         }
     };
-    
+
     clearBtn.onclick = () => { log.textContent = ""; };
 
     sendBtn.onclick = async () => {
-        const text = (msgEl.value||"").trim(); if(!text) return;
-        addLine("you", "You", text); msgEl.value="";
-        
+        const text = (msgEl.value || "").trim();
+        if (!text) return;
+        addLine("you", "You", text);
+        msgEl.value = "";
+
         const useStream = !!streamBox.checked;
-        
-        if(!useStream){
-            // Non-Streaming (POST /chat)
+        const payload = {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ message: text }),
+        };
+
+        if (!useStream) {
+            // --- Non-Streaming Logic (already correct) ---
             try {
-                const r = await fetch(`${API}/chat`, {
-                    method: "POST",
-                    // We send the SID via header for session tracking
-                    headers: {"Content-Type": "application/json", "X-Session-Id": getSID()},
-                    body: JSON.stringify({message: text}),
-                    credentials: "include"
-                });
-                
-                const j = await r.json(); 
-                
-                // FIX 3: Corrected response key from j?.response to j?.message
-                const responseText = j?.message ?? "[No response or response key mismatch]";
+                const r = await fetch(`${API}/chat`, payload);
+                const j = await r.json();
+                const responseText = j?.text ?? "[No response or response key mismatch]";
                 addLine("bot", "Bot", responseText);
-                
-                if (j?.session_id) localStorage.setItem("sid", j.session_id);
-                if (j?.sources) {
-                     addDbg(`Source: ${j.sources.ref} (${j.sources.source})`);
-                }
-                
-            } catch(e) { 
-                addLine("bot", "Bot", "[Network Error] "+(e?.message||e)); 
+                if (j?.footer) addDbg(j.footer);
+            } catch (e) {
+                addLine("bot", "Bot", "[Network Error] " + (e?.message || e));
             }
             return;
         }
 
-        // Streaming (GET /chat_sse)
-        const tryStream = (attempt = 1) => {
-            startLive();
+        // --- ★★★ FIX 2: NEW Streaming Logic using POST /chat ★★★ ---
+        try {
+            const response = await fetch(`${API}/chat`, payload);
+            if (!response.body) throw new Error("Response body is missing.");
             
-            // FIX 2: Corrected query parameter name from 'q' to 'message'
-            const url = `${API}/chat_sse?message=${encodeURIComponent(text)}&_=${Date.now()}`;
-            
-            const es = new EventSource(url);
-            let gotAny = false;
-            
-            es.onopen = () => addDbg("[SSE Opened]");
-            
-            es.addEventListener("start", (ev) => {
-                const obj = JSON.parse(ev.data);
-                if(obj.session_id) localStorage.setItem("sid", obj.session_id);
-                if(obj.faith && obj.faith !== 'none') addDbg(`Session Faith Set: ${obj.faith}`);
-            });
-            
-            es.addEventListener("sources", (ev) => {
-                const obj = JSON.parse(ev.data);
-                // Store source info temporarily to display after stream ends
-                if (live) live.sourceInfo = obj;
-            });
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = "";
 
-            es.addEventListener("message", (ev) => {
-                if (!ev.data) return;
-                try { 
-                    const obj = JSON.parse(ev.data); 
-                    if (obj.text) { 
-                        pushLive(obj.text); 
-                        gotAny = true; 
-                    } else {
-                        pushLive(ev.data + "\n");
+            const { line, msgSpan } = addLine("bot", "Bot", "");
+            const cursor = document.createElement("span");
+            cursor.className = "cursor inline-block w-1.5 h-4 bg-gray-500 align-middle ml-0.5 animate-pulse rounded-sm";
+            line.appendChild(cursor);
+
+            let fullText = "";
+
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+
+                buffer += decoder.decode(value, { stream: true });
+                const lines = buffer.split("\n\n");
+                buffer = lines.pop(); // Keep the last, possibly incomplete line
+
+                for (const line of lines) {
+                    if (line.startsWith("data: ")) {
+                        const data = line.substring(6).trim();
+                        if (data === "[END]") continue;
+                        try {
+                            const obj = JSON.parse(data);
+                            if (obj.text) {
+                                fullText += obj.text;
+                                msgSpan.textContent = fullText;
+                            }
+                            if (obj.footer) {
+                                fullText += obj.footer;
+                                msgSpan.textContent = fullText;
+                            }
+                        } catch(e) { /* Ignore non-json data chunks */ }
                     }
-                } catch { 
-                    pushLive(ev.data + "\n"); 
                 }
-            });
+                log.scrollTop = log.scrollHeight;
+            }
+            cursor.remove();
 
-            es.addEventListener("footer", (ev) => {
-                // The footer event contains the mandatory referral text
-                try {
-                    const obj = JSON.parse(ev.data);
-                    if (obj.text) {
-                        pushLive(obj.text);
-                    }
-                } catch {}
-            });
-
-            es.addEventListener("end", () => {
-                addDbg("[Stream End]"); 
-                es.close(); 
-                endLive(); 
-            });
-
-            es.onerror = () => { 
-                es.close(); 
-                if (!gotAny && attempt === 1) { 
-                    addDbg("[SSE Retry Attempt]"); 
-                    endLive(); 
-                    setTimeout(() => tryStream(2), 800); 
-                } else { 
-                    addLine("bot", "Bot", "[Stream Error: connection lost or failed to initialize]"); 
-                    endLive(); 
-                } 
-            };
-            
-            // Set a generous timeout to close the connection if the server hangs
-            setTimeout(() => { try{es.close(); endLive();}catch{} }, 90000); 
-        };
-        tryStream();
+        } catch (e) {
+            addLine("bot", "Bot", "[Stream Error] " + (e?.message || e));
+        }
     };
 
-    msgEl.addEventListener("keydown",(e)=>{ if(e.key==="Enter"&&(e.metaKey||e.ctrlKey)) sendBtn.onclick(); });
-    
-    // Initial silent health check
-    (async()=>{ try{ await fetch(`${API}/diag_rag`, {mode:"no-cors"}); }catch{} })();
+    msgEl.addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) sendBtn.onclick(); });
+
+    // Initial silent health check (also fixed)
+    (async () => { try { await fetch(`${API}/diag`); } catch {} })();
 </script>
 </body>
 </html>
