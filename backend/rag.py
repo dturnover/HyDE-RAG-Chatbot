@@ -16,8 +16,16 @@ def embed_query(text: str) -> Optional[List[float]]:
         return response.data[0].embedding
     except Exception: return None
 
+# ★★★ THE FIX IS HERE: ADDING THE HELPER FUNCTIONS BACK ★★★
 def tokenize(s: str) -> set[str]:
+    """Helper function to break text into unique words for lexical search."""
     return set(re.findall(r"\w+", s.lower()))
+
+def jaccard(a: set[str], b: set[str]) -> float:
+    """Helper function to calculate lexical similarity (keyword overlap)."""
+    if not a or not b: return 0.0
+    return len(a & b) / len(a | b)
+# ★★★ END OF FIX ★★★
 
 def cos_sim(a: List[float], b: List[float]) -> float:
     if not a or not b: return 0.0
@@ -27,13 +35,11 @@ def cos_sim(a: List[float], b: List[float]) -> float:
     return dot_product / (norm_a * norm_b) if norm_a > 0 and norm_b > 0 else 0.0
 
 def hybrid_search(query: str, corpus_name: str, top_k: int = 5) -> List[Dict[str, Any]]:
-    # ★★★ THE FIX IS HERE ★★★
-    # The filename does not contain '_embed'. This is the final correction.
+    # This function now has the helper functions it needs
     file_name = f"{corpus_name}.jsonl"
     path = RAG_DATA_PATH / file_name
 
     if not path.exists():
-        # This debug print will no longer appear
         print(f"[DEBUG hybrid_search] Corpus path not found at: {path}. Exiting.")
         return []
 
