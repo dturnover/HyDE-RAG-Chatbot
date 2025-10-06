@@ -3,16 +3,13 @@ import re, json, math
 from typing import Dict, List, Any, Optional
 from pathlib import Path
 from openai import OpenAI
-import config # Still needed for FAITH_KEYWORDS
+import config
 
 client = OpenAI(api_key=config.OPENAI_API_KEY) if config.OPENAI_API_KEY else None
 
-# ★★★ THE FINAL FIX IS HERE ★★★
-# Define the path directly in the file that uses it to avoid import issues.
 RAG_DATA_PATH = Path("/opt/render/project/src/indexes")
 
 def embed_query(text: str) -> Optional[List[float]]:
-    # ... function is unchanged
     if not client: return None
     try:
         response = client.embeddings.create(model=config.EMBED_MODEL, input=text)
@@ -20,11 +17,9 @@ def embed_query(text: str) -> Optional[List[float]]:
     except Exception: return None
 
 def tokenize(s: str) -> set[str]:
-    # ... function is unchanged
     return set(re.findall(r"\w+", s.lower()))
 
 def cos_sim(a: List[float], b: List[float]) -> float:
-    # ... function is unchanged
     if not a or not b: return 0.0
     dot_product = sum(x * y for x, y in zip(a, b))
     norm_a = math.sqrt(sum(x * x for x in a))
@@ -32,15 +27,16 @@ def cos_sim(a: List[float], b: List[float]) -> float:
     return dot_product / (norm_a * norm_b) if norm_a > 0 and norm_b > 0 else 0.0
 
 def hybrid_search(query: str, corpus_name: str, top_k: int = 5) -> List[Dict[str, Any]]:
-    file_name = f"{corpus_name}_embed.jsonl"
-    # Use the RAG_DATA_PATH defined directly in this file
+    # ★★★ THE FIX IS HERE ★★★
+    # The filename does not contain '_embed'. This is the final correction.
+    file_name = f"{corpus_name}.jsonl"
     path = RAG_DATA_PATH / file_name
 
     if not path.exists():
+        # This debug print will no longer appear
         print(f"[DEBUG hybrid_search] Corpus path not found at: {path}. Exiting.")
         return []
 
-    # ... the rest of the search logic is unchanged ...
     q_tokens = tokenize(query)
     q_emb = embed_query(query)
     if not q_emb: return []
