@@ -3,14 +3,16 @@ import re, json, math
 from typing import Dict, List, Any, Optional
 from pathlib import Path
 from openai import OpenAI
-import config
+import config # Still needed for FAITH_KEYWORDS
 
 client = OpenAI(api_key=config.OPENAI_API_KEY) if config.OPENAI_API_KEY else None
 
-CORPUS_FILES: Dict[str, Path] = { k: config.RAG_DATA_PATH / f"{k}_embed.jsonl" for k in config.FAITH_KEYWORDS.values() }
-AVAILABLE_CORPORA = {k: v for k, v in CORPUS_FILES.items() if v.exists() and v.stat().st_size > 0}
+# ★★★ THE FINAL FIX IS HERE ★★★
+# Define the path directly in the file that uses it to avoid import issues.
+RAG_DATA_PATH = Path("/opt/render/project/src/indexes")
 
 def embed_query(text: str) -> Optional[List[float]]:
+    # ... function is unchanged
     if not client: return None
     try:
         response = client.embeddings.create(model=config.EMBED_MODEL, input=text)
@@ -18,13 +20,11 @@ def embed_query(text: str) -> Optional[List[float]]:
     except Exception: return None
 
 def tokenize(s: str) -> set[str]:
+    # ... function is unchanged
     return set(re.findall(r"\w+", s.lower()))
 
-def jaccard(a: set[str], b: set[str]) -> float:
-    if not a or not b: return 0.0
-    return len(a & b) / len(a | b)
-
 def cos_sim(a: List[float], b: List[float]) -> float:
+    # ... function is unchanged
     if not a or not b: return 0.0
     dot_product = sum(x * y for x, y in zip(a, b))
     norm_a = math.sqrt(sum(x * x for x in a))
@@ -32,20 +32,18 @@ def cos_sim(a: List[float], b: List[float]) -> float:
     return dot_product / (norm_a * norm_b) if norm_a > 0 and norm_b > 0 else 0.0
 
 def hybrid_search(query: str, corpus_name: str, top_k: int = 5) -> List[Dict[str, Any]]:
-    print("\n--- [DEBUG] Entering hybrid_search ---")
-    print(f"[DEBUG] Query: '{query}'")
-    print(f"[DEBUG] Corpus: '{corpus_name}'")
+    file_name = f"{corpus_name}_embed.jsonl"
+    # Use the RAG_DATA_PATH defined directly in this file
+    path = RAG_DATA_PATH / file_name
 
-    path = AVAILABLE_CORPORA.get(corpus_name)
-    if not path:
-        print("[DEBUG] Corpus path not found. Exiting.")
+    if not path.exists():
+        print(f"[DEBUG hybrid_search] Corpus path not found at: {path}. Exiting.")
         return []
 
+    # ... the rest of the search logic is unchanged ...
     q_tokens = tokenize(query)
     q_emb = embed_query(query)
-    if not q_emb:
-        print("[DEBUG] Failed to generate query embedding. Exiting.")
-        return []
+    if not q_emb: return []
 
     alpha = 0.2
     scored_docs = []
@@ -61,21 +59,10 @@ def hybrid_search(query: str, corpus_name: str, top_k: int = 5) -> List[Dict[str
                 vector_score = cos_sim(q_emb, embedding)
                 final_score = (alpha * lexical_score) + ((1 - alpha) * vector_score)
                 
-                scored_docs.append((final_score, row))
+                if final_score > 0.22:
+                    scored_docs.append((final_score, row))
             except (json.JSONDecodeError, TypeError):
                 continue
     
     scored_docs.sort(key=lambda x: x[0], reverse=True)
-    
-    print("\n[DEBUG] Top 10 potential matches (before threshold):")
-    for i, (score, doc) in enumerate(scored_docs[:10]):
-        ref = doc.get('ref', 'Unknown')
-        print(f"[DEBUG]   {i+1}. Score: {score:.4f} | Ref: {ref} | Text: '{doc.get('text', '')[:50]}...'")
-
-    threshold = 0.22
-    final_results = [doc for score, doc in scored_docs if score > threshold][:top_k]
-    
-    print(f"\n[DEBUG] Found {len(final_results)} results passing threshold > {threshold}")
-    print("--- [DEBUG] Leaving hybrid_search ---\n")
-    
-    return final_results
+    return [doc for score, doc in scored_docs[:top_k]]
