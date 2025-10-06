@@ -1,9 +1,25 @@
 # logic.py
 import re
-from typing import Dict, Optional
-from state import SessionState
+from typing import Dict, List, Optional
+from dataclasses import dataclass, field
 import config
 import rag
+
+
+@dataclass
+class SessionState:
+    history: List[Dict[str, str]] = field(default_factory=list)
+    faith: Optional[str] = None
+    # Simplified internal state for stateless operation
+    @property
+    def _chap(self):
+        class MockChap:
+            escalate = "none"
+            turns = len(self.history) // 2
+        return MockChap()
+
+# ... the rest of your logic.py file remains the same ...
+# (system_message, try_set_faith, get_rag_context, etc.)
 
 def _edit_distance(s1: str, s2: str) -> int:
     """Calculates the Levenshtein edit distance between two strings."""
