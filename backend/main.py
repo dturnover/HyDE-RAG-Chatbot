@@ -1,5 +1,5 @@
 # main.py
-import json
+import json, uuid
 from fastapi import FastAPI, Request, Response, HTTPException
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -8,48 +8,39 @@ import config, rag, logic, state
 
 app = FastAPI(title="Fight Chaplain Backend")
 
-# List of allowed domains for CORS
-origins = [
-    "http://localhost",
-    "http://localhost:3000",
-    # Add your deployed frontend's domain here if you have one
-    # e.g., "https://your-frontend-name.onrender.com"
-]
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # Using wildcard for simplicity, can be replaced with `origins` list
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
-    # ★★★ THE FIX IS HERE ★★★
-    # Explicitly list the custom header we need the browser to allow.
-    allow_headers=["Content-Type", "X-Session-Id"],
+    allow_headers=["Content-Type", "X-Session-Id"], # Keep header for other potential uses
 )
 
 @app.get("/diag")
 async def diagnostics():
-    """Endpoint to check backend status and configuration."""
-    return {
-        "status": "ok",
-        "openai_model": config.OPENAI_MODEL,
-        "embedding_model": config.EMBED_MODEL,
-        "rag_path": str(config.RAG_DATA_PATH),
-        "available_corpora": list(rag.AVAILABLE_CORPORA.keys())
-    }
+    return { "status": "ok", "openai_model": config.OPENAI_MODEL }
 
+# ★★★ MODIFIED CHAT HANDLER ★★★
 @app.post("/chat")
-async def chat_handler(request: Request, response: Response):
-    """Main chat endpoint, supporting streaming via query parameter."""
-    sid, s = state.get_or_create_session(request, response)
-    
+async def chat_handler(request: Request):
     try:
         data = await request.json()
         msg = data.get("message", "").strip()
+        sid = data.get("sid") # Look for the session ID in the JSON body
         if not msg:
             raise HTTPException(status_code=400, detail="Message cannot be empty.")
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON payload.")
+    
+    # Get or create session using the provided sid
+    if sid and sid in state.SESSIONS:
+        s = state.SESSIONS[sid]
+    else:
+        sid = uuid.uuid4().hex
+        s = state.SessionState()
+        state.SESSIONS[sid] = s
 
+    # The rest of the logic flow remains the same
     logic.try_set_faith(msg, s)
     logic.update_session_metrics(msg, s)
     s.history.append({"role": "user", "content": msg})
@@ -62,11 +53,11 @@ async def chat_handler(request: Request, response: Response):
     messages_for_llm = [sys_msg] + s.history[1:]
 
     async def stream_generator():
+        # First, send the session ID back to the client, just like the old app
+        yield f"event: start\ndata: {json.dumps({'sid': sid})}\n\n"
+        
         full_response = ""
-        if not rag.client:
-            yield f"data: {json.dumps({'error': 'OpenAI client not configured.'})}\n\n"
-            return
-            
+        # ... the rest of the streaming logic is the same ...
         try:
             stream = rag.client.chat.completions.create(
                 model=config.OPENAI_MODEL,

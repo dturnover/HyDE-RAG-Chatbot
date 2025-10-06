@@ -1,65 +1,9 @@
 <!doctype html>
 <html lang="en">
 <head>
-    <meta charset="utf-8"/>
-    <title>Fight Chaplain LLM Demo</title>
-    <meta name="viewport" content="width=device-width,initial-scale=1"/>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <style>
-        #log::-webkit-scrollbar { width: 8px; }
-        #log::-webkit-scrollbar-thumb { background-color: #cbd5e1; border-radius: 10px; }
-        #log::-webkit-scrollbar-track { background-color: #f1f5f9; }
-    </style>
-    <script>
-        tailwind.config = {
-            theme: {
-                extend: {
-                    fontFamily: {
-                        sans: ['Inter', 'system-ui', 'Arial', 'sans-serif'],
-                    },
-                    colors: {
-                        'primary-green': '#059669',
-                        'secondary-gray': '#4b5563',
-                        'bg-light': '#f9fafb',
-                    }
-                }
-            }
-        }
-    </script>
-</head>
+    </head>
 <body class="bg-bg-light min-h-screen p-4 sm:p-6 font-sans">
-    <div class="max-w-3xl mx-auto bg-white shadow-xl rounded-2xl p-6 md:p-8">
-        <h2 class="text-3xl font-bold text-gray-800 mb-6 border-b pb-2">
-            Fight Chaplain Demo
-        </h2>
-
-        <div class="flex flex-wrap items-center gap-3 mb-6">
-            <button id="health" class="px-4 py-2 bg-indigo-600 text-white font-medium rounded-lg hover:bg-indigo-700 transition duration-150 shadow-md">
-                Check Backend
-            </button>
-            <label class="text-sm text-secondary-gray flex items-center gap-1">
-                <input type="checkbox" id="stream" checked class="form-checkbox rounded text-primary-green">
-                Stream Response (SSE)
-            </label>
-            <button id="clear" class="px-4 py-2 bg-red-500 text-white font-medium rounded-lg hover:bg-red-600 transition duration-150 shadow-md">
-                Clear Log
-            </button>
-        </div>
-
-        <div id="log" class="border border-gray-300 bg-white rounded-xl p-4 md:p-5 min-h-80 max-h-[60vh] overflow-y-auto mb-6 shadow-inner text-sm">
-            <div class="text-gray-500 italic">Start by clicking 'Check Backend' or sending a message.</div>
-        </div>
-
-        <div class="flex gap-4 items-end">
-            <textarea id="msg" rows="3" placeholder="Type your message... (e.g., I'm feeling stressed. Can you find me a verse from the Bible?)"
-                      class="flex-grow w-full p-3 border border-gray-300 rounded-lg focus:ring-primary-green focus:border-primary-green transition duration-150 resize-none text-gray-700"></textarea>
-            <button id="send" class="h-14 w-20 bg-primary-green text-white font-semibold rounded-lg hover:bg-green-700 transition duration-150 shadow-lg flex items-center justify-center">
-                Send
-            </button>
-        </div>
-    </div>
-
-<script>
+    <script>
     const API = "https://llm-api-demo-5qz1.onrender.com";
 
     const log = document.getElementById("log");
@@ -69,80 +13,41 @@
     const sendBtn = document.getElementById("send");
     const streamBox = document.getElementById("stream");
 
-    const getSID = () => {
-        let sid = localStorage.getItem("sid");
-        if (!sid) {
-            sid = crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2);
-            localStorage.setItem("sid", sid);
-        }
-        return sid;
-    };
+    const getSID = () => localStorage.getItem("sid");
+    const setSID = (sid) => localStorage.setItem("sid", sid);
 
-    const addLine = (cls, role, text = "") => {
-        const line = document.createElement("div");
-        line.className = `line ${cls} py-1`;
-        const r = document.createElement("span");
-        r.className = `role font-semibold mr-2 ${cls === 'bot' ? 'text-primary-green' : 'text-indigo-600'}`;
-        r.textContent = role + ":";
-        const m = document.createElement("span");
-        m.className = "msg text-gray-800 whitespace-pre-wrap";
-        m.textContent = text;
-        line.appendChild(r);
-        line.appendChild(m);
-        log.appendChild(line);
-        log.scrollTop = log.scrollHeight;
-        return { line, msgSpan: m };
-    };
-
-    const addDbg = (t) => {
-        const d = document.createElement("div");
-        d.className = "line text-xs text-gray-500 italic pt-1 border-t border-gray-100 mt-2";
-        d.textContent = `[Debug] ${t}`;
-        log.appendChild(d);
-        log.scrollTop = log.scrollHeight;
-    };
-
-    healthBtn.onclick = async () => {
-        try {
-            const r = await fetch(`${API}/diag`);
-            const json = await r.json();
-            addDbg(`Backend Status: OK | Model: ${json.openai_model}`);
-        } catch (e) {
-            addDbg(`Backend Error: ${e?.message||e}. Ensure Render service is running at ${API}`);
-        }
-    };
-
-    clearBtn.onclick = () => { log.innerHTML = ""; };
-
+    // ... addLine, addDbg, healthBtn.onclick, clearBtn.onclick are unchanged ...
+    
     sendBtn.onclick = async () => {
         const text = (msgEl.value || "").trim();
         if (!text) return;
         addLine("you", "You", text);
         msgEl.value = "";
 
+        // ★★★ MODIFIED PAYLOAD ★★★
         const payload = {
             method: "POST",
-            headers: {
-                "Content-Type": "application/json",
-                "X-Session-Id": getSID()
-            },
-            body: JSON.stringify({ message: text }),
+            headers: { "Content-Type": "application/json" },
+            // Send the SID in the body, not a header
+            body: JSON.stringify({ message: text, sid: getSID() }),
         };
 
         const useStream = !!streamBox.checked;
         if (!useStream) {
+            // Non-streaming logic updated as well
             try {
                 const r = await fetch(`${API}/chat`, payload);
                 const j = await r.json();
                 const responseText = j?.text ?? "[No response or response key mismatch]";
                 addLine("bot", "Bot", responseText);
-                if (j?.footer) addDbg(j.footer);
+                if (j?.sid) setSID(j.sid); // Update SID if server sends a new one
             } catch (e) {
                 addLine("bot", "Bot", "[Network Error] " + (e?.message || e));
             }
             return;
         }
 
+        // Streaming logic using the proven method
         try {
             const response = await fetch(`${API}/chat`, payload);
             if (!response.body) throw new Error("Response body is missing.");
@@ -155,7 +60,6 @@
             const cursor = document.createElement("span");
             cursor.className = "cursor inline-block w-1.5 h-4 bg-gray-500 align-middle ml-0.5 animate-pulse rounded-sm";
             line.appendChild(cursor);
-
             let fullText = "";
 
             while (true) {
@@ -167,20 +71,28 @@
                 buffer = lines.pop();
 
                 for (const line of lines) {
-                    if (line.startsWith("data: ")) {
-                        const data = line.substring(6).trim();
+                    if (!line.startsWith("data:") && !line.startsWith("event:")) continue;
+
+                    const eventMatch = line.match(/^event: (.*)$/m);
+                    const dataMatch = line.match(/^data: (.*)$/m);
+
+                    if (eventMatch && dataMatch) {
+                        const eventName = eventMatch[1];
+                        const data = dataMatch[1];
+                        
+                        // ★★★ LISTEN FOR 'start' EVENT ★★★
+                        if (eventName === 'start') {
+                            const obj = JSON.parse(data);
+                            if (obj.sid) setSID(obj.sid); // Save the session ID from the server
+                        }
+                    } else if (dataMatch) {
+                        const data = dataMatch[1];
                         if (data === "[END]") continue;
                         try {
                             const obj = JSON.parse(data);
-                            if (obj.text) {
-                                fullText += obj.text;
-                                msgSpan.textContent = fullText;
-                            }
-                            if (obj.footer) {
-                                fullText += obj.footer;
-                                msgSpan.textContent = fullText;
-                            }
-                        } catch(e) { /* Ignore non-json data chunks */ }
+                            if (obj.text) { fullText += obj.text; msgSpan.textContent = fullText; }
+                            if (obj.footer) { fullText += obj.footer; msgSpan.textContent = fullText; }
+                        } catch (e) { /* ignore */ }
                     }
                 }
                 log.scrollTop = log.scrollHeight;
@@ -190,10 +102,8 @@
             addLine("bot", "Bot", "[Stream Error] " + (e?.message || e));
         }
     };
-
-    msgEl.addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) sendBtn.onclick(); });
-
-    (async () => { try { await fetch(`${API}/diag`); } catch {} })();
+    
+    // ... other functions and event listeners ...
 </script>
 </body>
 </html>
