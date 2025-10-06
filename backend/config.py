@@ -8,10 +8,9 @@ OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 EMBED_MODEL    = os.getenv("EMBED_MODEL", "text-embedding-3-small")
 
 # --- RAG Index Configuration ---
-# Point this directly to your Render Disk's mount path from the screenshot.
 RAG_DATA_PATH = Path("/opt/render/project/src/indexes")
 
-# --- ★★★ DEBUG STATEMENTS ★★★ ---
+# --- DEBUG STATEMENTS ---
 print("\n--- [DEBUG] Loading config.py ---")
 print(f"[DEBUG config.py] OpenAI Model: {OPENAI_MODEL}")
 print(f"[DEBUG config.py] RAG_DATA_PATH set to: {RAG_DATA_PATH}")
@@ -21,8 +20,19 @@ try:
     is_directory = RAG_DATA_PATH.is_dir()
     print(f"[DEBUG config.py] -> Does the path exist? {path_exists}")
     print(f"[DEBUG config.py] -> Is it a directory? {is_directory}")
+    
     if path_exists and is_directory:
         print("[DEBUG config.py] SUCCESS: RAG data path is valid.")
+        
+        # ★★★ NEW: List the contents of the directory ★★★
+        print("[DEBUG config.py] Listing contents of RAG data path:")
+        found_files = False
+        for item in RAG_DATA_PATH.iterdir():
+            print(f"[DEBUG config.py]   - Found: {item.name}")
+            found_files = True
+        if not found_files:
+            print("[DEBUG config.py]   - WARNING: Directory is empty.")
+            
     else:
         print("[DEBUG config.py] ERROR: RAG data path is invalid or not found.")
 except Exception as e:
