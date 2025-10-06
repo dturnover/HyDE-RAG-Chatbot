@@ -8,25 +8,37 @@ OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 EMBED_MODEL    = os.getenv("EMBED_MODEL", "text-embedding-3-small")
 
 # --- RAG Index Configuration ---
-def get_rag_data_path() -> Path:
-    here = Path(__file__).parent.resolve()
-    search_paths = [
-        Path(os.getenv("RAG_DIR", "")),
-        here / "indexes",
-        here.parent / "indexes",
-        Path("/opt/render/project/src/indexes")
-    ]
-    for p in search_paths:
-        if p and p.is_dir():
-            return p
-    return here
+# Point this directly to your Render Disk's mount path from the screenshot.
+RAG_DATA_PATH = Path("/opt/render/project/src/indexes")
 
-RAG_DATA_PATH = get_rag_data_path()
+# --- ★★★ DEBUG STATEMENTS ★★★ ---
+print("\n--- [DEBUG] Loading config.py ---")
+print(f"[DEBUG config.py] OpenAI Model: {OPENAI_MODEL}")
+print(f"[DEBUG config.py] RAG_DATA_PATH set to: {RAG_DATA_PATH}")
+print(f"[DEBUG config.py] Checking path existence...")
+try:
+    path_exists = RAG_DATA_PATH.exists()
+    is_directory = RAG_DATA_PATH.is_dir()
+    print(f"[DEBUG config.py] -> Does the path exist? {path_exists}")
+    print(f"[DEBUG config.py] -> Is it a directory? {is_directory}")
+    if path_exists and is_directory:
+        print("[DEBUG config.py] SUCCESS: RAG data path is valid.")
+    else:
+        print("[DEBUG config.py] ERROR: RAG data path is invalid or not found.")
+except Exception as e:
+    print(f"[DEBUG config.py] ERROR: An exception occurred while checking the path: {e}")
+print("--- [DEBUG] Finished loading config.py ---\n")
+# --- END DEBUG STATEMENTS ---
 
 # --- Chaplain Logic Keywords ---
 ASK_WORDS = {"verse", "scripture", "psalm", "quote", "passage", "bible"}
 DISTRESS_KEYWORDS = {"scared", "anxious", "worried", "nervous", "afraid", "stress"}
 FAITH_KEYWORDS = {
-    "catholic": "bible_nrsv", "christian": "bible_asv", "protestant": "bible_asv",
-    "jewish": "tanakh", "muslim": "quran", "islam": "quran", "hindu": "gita"
+    "catholic": "bible_nrsv",
+    "christian": "bible_asv",
+    "protestant": "bible_asv",
+    "jewish": "tanakh",
+    "muslim": "quran",
+    "islam": "quran",
+    "hindu": "gita",
 }
