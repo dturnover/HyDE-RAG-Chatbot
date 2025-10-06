@@ -1,7 +1,7 @@
 # rag.py
 import re, json, math
 from typing import Dict, List, Any, Optional
-from pathlib import Path  # ★★★ THE FIX IS HERE ★★★
+from pathlib import Path
 from openai import OpenAI
 import config
 
@@ -31,7 +31,7 @@ def cos_sim(a: List[float], b: List[float]) -> float:
     norm_b = math.sqrt(sum(y * y for y in b))
     return dot_product / (norm_a * norm_b) if norm_a > 0 and norm_b > 0 else 0.0
 
-def hybrid_search(query: str, corpus_name: str, top_k: int = 3) -> List[Dict[str, Any]]:
+def hybrid_search(query: str, corpus_name: str, top_k: int = 5) -> List[Dict[str, Any]]: # Increased top_k
     path = AVAILABLE_CORPORA.get(corpus_name)
     if not path: return []
 
@@ -57,7 +57,9 @@ def hybrid_search(query: str, corpus_name: str, top_k: int = 3) -> List[Dict[str
                 
                 final_score = (alpha * lexical_score) + ((1 - alpha) * vector_score)
                 
-                if final_score > 0.3:
+                # ★★★ THE FIX IS HERE ★★★
+                # Lowered the threshold to be more inclusive of relevant, but not perfect, matches.
+                if final_score > 0.22:
                     scored_docs.append((final_score, row))
 
             except (json.JSONDecodeError, TypeError):
