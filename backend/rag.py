@@ -1,6 +1,7 @@
 # rag.py
 import re, json, math
 from typing import Dict, List, Any, Optional
+from pathlib import Path  # ★★★ THE FIX IS HERE ★★★
 from openai import OpenAI
 import config
 
@@ -16,7 +17,6 @@ def embed_query(text: str) -> Optional[List[float]]:
         return response.data[0].embedding
     except Exception: return None
 
-# --- UTILITIES ---
 def tokenize(s: str) -> set[str]:
     return set(re.findall(r"\w+", s.lower()))
 
@@ -31,7 +31,6 @@ def cos_sim(a: List[float], b: List[float]) -> float:
     norm_b = math.sqrt(sum(y * y for y in b))
     return dot_product / (norm_a * norm_b) if norm_a > 0 and norm_b > 0 else 0.0
 
-# ★★★ REWRITTEN AND SIMPLIFIED SEARCH FUNCTION ★★★
 def hybrid_search(query: str, corpus_name: str, top_k: int = 3) -> List[Dict[str, Any]]:
     path = AVAILABLE_CORPORA.get(corpus_name)
     if not path: return []
@@ -53,21 +52,17 @@ def hybrid_search(query: str, corpus_name: str, top_k: int = 3) -> List[Dict[str
                 if not text or not isinstance(embedding, list):
                     continue
 
-                # Calculate lexical and vector scores
                 lexical_score = jaccard(q_tokens, tokenize(text))
                 vector_score = cos_sim(q_emb, embedding)
-
-                # Naive blend. For queries like "nervous", lexical_score will be near 0
-                # which is fine. The vector_score will do all the work.
+                
                 final_score = (alpha * lexical_score) + ((1 - alpha) * vector_score)
                 
-                if final_score > 0.3: # Basic threshold to filter out noise
+                if final_score > 0.3:
                     scored_docs.append((final_score, row))
 
             except (json.JSONDecodeError, TypeError):
                 continue
     
-    # Sort by the final score in descending order and return the top results
     scored_docs.sort(key=lambda x: x[0], reverse=True)
     
     return [doc for score, doc in scored_docs[:top_k]]
