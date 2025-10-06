@@ -31,16 +31,23 @@ def cos_sim(a: List[float], b: List[float]) -> float:
     norm_b = math.sqrt(sum(y * y for y in b))
     return dot_product / (norm_a * norm_b) if norm_a > 0 and norm_b > 0 else 0.0
 
-def hybrid_search(query: str, corpus_name: str, top_k: int = 5) -> List[Dict[str, Any]]: # Increased top_k
+def hybrid_search(query: str, corpus_name: str, top_k: int = 5) -> List[Dict[str, Any]]:
+    print("\n--- [DEBUG] Entering hybrid_search ---")
+    print(f"[DEBUG] Query: '{query}'")
+    print(f"[DEBUG] Corpus: '{corpus_name}'")
+
     path = AVAILABLE_CORPORA.get(corpus_name)
-    if not path: return []
+    if not path:
+        print("[DEBUG] Corpus path not found. Exiting.")
+        return []
 
     q_tokens = tokenize(query)
     q_emb = embed_query(query)
-    if not q_emb: return []
+    if not q_emb:
+        print("[DEBUG] Failed to generate query embedding. Exiting.")
+        return []
 
-    alpha = 0.2 # 20% lexical, 80% semantic
-
+    alpha = 0.2
     scored_docs = []
     with path.open("r", encoding="utf-8") as f:
         for line in f:
@@ -48,23 +55,27 @@ def hybrid_search(query: str, corpus_name: str, top_k: int = 5) -> List[Dict[str
                 row = json.loads(line)
                 text = row.get("text", "")
                 embedding = row.get("embedding")
-
-                if not text or not isinstance(embedding, list):
-                    continue
+                if not text or not isinstance(embedding, list): continue
 
                 lexical_score = jaccard(q_tokens, tokenize(text))
                 vector_score = cos_sim(q_emb, embedding)
-                
                 final_score = (alpha * lexical_score) + ((1 - alpha) * vector_score)
                 
-                # ★★★ THE FIX IS HERE ★★★
-                # Lowered the threshold to be more inclusive of relevant, but not perfect, matches.
-                if final_score > 0.22:
-                    scored_docs.append((final_score, row))
-
+                scored_docs.append((final_score, row))
             except (json.JSONDecodeError, TypeError):
                 continue
     
     scored_docs.sort(key=lambda x: x[0], reverse=True)
     
-    return [doc for score, doc in scored_docs[:top_k]]
+    print("\n[DEBUG] Top 10 potential matches (before threshold):")
+    for i, (score, doc) in enumerate(scored_docs[:10]):
+        ref = doc.get('ref', 'Unknown')
+        print(f"[DEBUG]   {i+1}. Score: {score:.4f} | Ref: {ref} | Text: '{doc.get('text', '')[:50]}...'")
+
+    threshold = 0.22
+    final_results = [doc for score, doc in scored_docs if score > threshold][:top_k]
+    
+    print(f"\n[DEBUG] Found {len(final_results)} results passing threshold > {threshold}")
+    print("--- [DEBUG] Leaving hybrid_search ---\n")
+    
+    return final_results
