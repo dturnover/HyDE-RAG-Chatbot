@@ -1,28 +1,22 @@
 # rag.py
-import re, json, math, heapq
-from typing import Dict, List, Optional, Any
-from pathlib import Path
-from dataclasses import dataclass
+import re, json, math
+from typing import Dict, List, Any, Optional
 from openai import OpenAI
 import config
 
-# --- OpenAI Client Initialization ---
 client = OpenAI(api_key=config.OPENAI_API_KEY) if config.OPENAI_API_KEY else None
 
-# --- Corpus Discovery ---
-CORPUS_FILES: Dict[str, Path] = {
-    key: config.RAG_DATA_PATH / f"{key}_embed.jsonl"
-    for key in config.FAITH_KEYWORDS.values()
-}
+CORPUS_FILES: Dict[str, Path] = { k: config.RAG_DATA_PATH / f"{k}_embed.jsonl" for k in config.FAITH_KEYWORDS.values() }
+AVAILABLE_CORPORA = {k: v for k, v in CORPUS_FILES.items() if v.exists() and v.stat().st_size > 0}
 
-def get_available_corpora() -> Dict[str, Path]:
-    """Returns a dictionary of corpus names to paths that actually exist."""
-    return {k: v for k, v in CORPUS_FILES.items() if v.exists() and v.stat().st_size > 0}
+def embed_query(text: str) -> Optional[List[float]]:
+    if not client: return None
+    try:
+        response = client.embeddings.create(model=config.EMBED_MODEL, input=text)
+        return response.data[0].embedding
+    except Exception: return None
 
-AVAILABLE_CORPORA = get_available_corpora()
-
-# --- Math & Text Utilities for Hybrid Search ---
-
+# --- UTILITIES ---
 def tokenize(s: str) -> set[str]:
     return set(re.findall(r"\w+", s.lower()))
 
@@ -37,91 +31,43 @@ def cos_sim(a: List[float], b: List[float]) -> float:
     norm_b = math.sqrt(sum(y * y for y in b))
     return dot_product / (norm_a * norm_b) if norm_a > 0 and norm_b > 0 else 0.0
 
-@dataclass
-class Stat:
-    """Welford's algorithm for stable, one-pass mean/std calculation."""
-    n: int = 0
-    mean: float = 0.0
-    m2: float = 0.0
-
-    def push(self, x: float):
-        self.n += 1
-        delta = x - self.mean
-        self.mean += delta / self.n
-        self.m2 += delta * (x - self.mean)
-
-    @property
-    def std(self) -> float:
-        if self.n < 2: return 1.0 # Avoid division by zero
-        return math.sqrt(self.m2 / self.n)
-
-# --- Core RAG Logic ---
-
-def embed_query(text: str) -> Optional[List[float]]:
-    if not client: return None
-    try:
-        response = client.embeddings.create(model=config.EMBED_MODEL, input=text)
-        return response.data[0].embedding
-    except Exception as e:
-        print(f"Embedding failed: {e}")
-        return None
-
-def hybrid_search(query: str, corpus_name: str, top_k: int = 6) -> List[Dict[str, Any]]:
+# ★★★ REWRITTEN AND SIMPLIFIED SEARCH FUNCTION ★★★
+def hybrid_search(query: str, corpus_name: str, top_k: int = 3) -> List[Dict[str, Any]]:
     path = AVAILABLE_CORPORA.get(corpus_name)
     if not path: return []
 
     q_tokens = tokenize(query)
     q_emb = embed_query(query)
+    if not q_emb: return []
 
-    lex_heap, vec_heap = [], []
-    lex_stat, vec_stat = Stat(), Stat()
-    candidates: Dict[int, Dict] = {}
-    lex_scores, vec_scores = {}, {}
+    alpha = 0.2 # 20% lexical, 80% semantic
 
-    # Single pass to score and gather stats
+    scored_docs = []
     with path.open("r", encoding="utf-8") as f:
-        for i, line in enumerate(f):
+        for line in f:
             try:
                 row = json.loads(line)
-                candidates[i] = row
+                text = row.get("text", "")
+                embedding = row.get("embedding")
+
+                if not text or not isinstance(embedding, list):
+                    continue
+
+                # Calculate lexical and vector scores
+                lexical_score = jaccard(q_tokens, tokenize(text))
+                vector_score = cos_sim(q_emb, embedding)
+
+                # Naive blend. For queries like "nervous", lexical_score will be near 0
+                # which is fine. The vector_score will do all the work.
+                final_score = (alpha * lexical_score) + ((1 - alpha) * vector_score)
                 
-                # Lexical Score
-                text_tokens = tokenize(row.get("text", ""))
-                js = jaccard(q_tokens, text_tokens)
-                lex_scores[i] = js
-                lex_stat.push(js)
-                heapq.heappush(lex_heap, (js, i))
-                if len(lex_heap) > 50: heapq.heappop(lex_heap)
+                if final_score > 0.3: # Basic threshold to filter out noise
+                    scored_docs.append((final_score, row))
 
-                # Vector Score
-                if q_emb and "embedding" in row:
-                    cs = cos_sim(q_emb, row["embedding"])
-                    vec_scores[i] = cs
-                    vec_stat.push(cs)
-                    heapq.heappush(vec_heap, (cs, i))
-                    if len(vec_heap) > 50: heapq.heappop(vec_heap)
-
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, TypeError):
                 continue
     
-    # Consolidate top candidates from both searches
-    top_indices = {idx for _, idx in lex_heap} | {idx for _, idx in vec_heap}
-    if not top_indices: return []
-
-    # Normalize scores and blend
-    mean_l, std_l = lex_stat.mean, lex_stat.std
-    mean_v, std_v = vec_stat.mean, vec_stat.std
+    # Sort by the final score in descending order and return the top results
+    scored_docs.sort(key=lambda x: x[0], reverse=True)
     
-    # ★★★ THE FIX IS HERE ★★★
-    alpha = 0.2  # 80% semantic, 20% lexical
-    
-    blended_scores = []
-    for idx in top_indices:
-        lz = (lex_scores.get(idx, 0) - mean_l) / std_l
-        vz = (vec_scores.get(idx, 0) - mean_v) / std_v
-        final_score = (alpha * lz) + ((1 - alpha) * vz)
-        blended_scores.append((final_score, candidates[idx]))
-
-    # Sort by blended score and return top_k
-    blended_scores.sort(key=lambda x: x[0], reverse=True)
-    return [doc for _, doc in blended_scores[:top_k]]
+    return [doc for score, doc in scored_docs[:top_k]]
