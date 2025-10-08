@@ -7,24 +7,44 @@ import config
 
 client = OpenAI(api_key=config.OPENAI_API_KEY) if config.OPENAI_API_KEY else None
 RAG_DATA_PATH = Path("/opt/render/project/src/indexes")
-CORPUS_CACHE: Dict[str, List[Dict]] = {}
 
-def load_corpus(corpus_name: str) -> List[Dict[str, Any]]:
-    if corpus_name in CORPUS_CACHE:
-        return CORPUS_CACHE[corpus_name]
+# ★★★ EXPANDED SYNONYM MAP ★★★
+SYNONYM_MAP = {
+    # Fear / Anxiety
+    "nervous": {"fear", "afraid", "anxious", "courage", "strength", "worry", "peace"},
+    "anxious": {"fear", "afraid", "anxious", "courage", "strength", "worry", "peace"},
+    "scared":  {"fear", "afraid", "anxious", "courage", "strength", "worry", "peace"},
+    "afraid":  {"fear", "afraid", "anxious", "courage", "strength", "worry", "peace"},
+    "worried": {"fear", "afraid", "anxious", "courage", "strength", "worry", "peace"},
+    "stress":  {"burden", "peace", "rest", "anxious", "worry", "strength"},
+    # Sadness / Loss
+    "sad":       {"sorrow", "mourn", "weep", "comfort", "joy", "despair", "broken", "spirit"},
+    "grief":     {"sorrow", "mourn", "weep", "comfort", "death", "loss"},
+    "hurting":   {"heal", "pain", "suffer", "broken", "comfort", "refuge"},
+    "lost":      {"found", "guide", "way", "path", "seek", "shepherd"},
+    "lonely":    {"alone", "comfort", "friend", "presence", "god", "lord"},
+    "heartbroken": {"heal", "broken", "heart", "comfort", "sorrow", "love"},
+    "depressed": {"despair", "hope", "lift", "spirit", "light", "darkness"},
+    # Anger / Frustration
+    "angry":       {"anger", "wrath", "rage", "forgive", "patience", "peace", "justice"},
+    "frustrated":  {"patience", "peace", "anger", "rest", "striving"},
+    "betrayed":    {"trust", "friend", "forgive", "love", "justice", "enemy"},
+    "resentful":   {"bitter", "forgive", "heart", "love", "peace"},
+    "bitter":      {"bitter", "forgive", "heart", "love", "peace"},
+    # Doubt / Uncertainty
+    "doubt":     {"faith", "believe", "trust", "wisdom", "understanding", "seek"},
+    "confused":  {"wisdom", "guidance", "understanding", "light", "path", "clarity"},
+    "uncertain": {"faith", "trust", "hope", "guide", "future", "path"},
+    "conflicted": {"peace", "heart", "mind", "wisdom", "guide"},
+    # Weakness / Failure
+    "weak":        {"strength", "power", "strong", "lift", "spirit", "grace"},
+    "failure":     {"fail", "fall", "rise", "grace", "forgive", "mercy", "redeem"},
+    "overwhelmed": {"burden", "rest", "peace", "strength", "help", "refuge"},
+    "guilt":       {"sin", "forgive", "mercy", "cleanse", "grace", "redeem"},
+    "shame":       {"sin", "forgive", "mercy", "honor", "grace", "glory"},
+    "stuck":       {"free", "deliver", "path", "way", "hope"},
+}
 
-    file_name = f"{corpus_name}.jsonl"
-    path = RAG_DATA_PATH / file_name
-    if not path.exists(): return []
-
-    docs = []
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            try: docs.append(json.loads(line))
-            except json.JSONDecodeError: continue
-    
-    CORPUS_CACHE[corpus_name] = docs
-    return docs
 
 def embed_query(text: str) -> Optional[List[float]]:
     if not client: return None
@@ -44,36 +64,43 @@ def cos_sim(a: List[float], b: List[float]) -> float:
     return dot_product / (norm_a * norm_b) if norm_a > 0 and norm_b > 0 else 0.0
 
 def hybrid_search(query: str, corpus_name: str, top_k: int = 5) -> List[Dict[str, Any]]:
-    docs = load_corpus(corpus_name)
-    if not docs: return []
+    file_name = f"{corpus_name}.jsonl"
+    path = RAG_DATA_PATH / file_name
+    if not path.exists(): return []
 
     q_tokens = tokenize(query)
     q_emb = embed_query(query)
     if not q_emb: return []
 
+    search_tokens = set(q_tokens)
+    for token in q_tokens:
+        if token in SYNONYM_MAP:
+            search_tokens.update(SYNONYM_MAP[token])
+
+    candidate_rows = []
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            if any(token in line.lower() for token in search_tokens):
+                try:
+                    candidate_rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    
+    if not candidate_rows: return []
+
     alpha = 0.05
     scored_docs = []
-    for row in docs:
+    for row in candidate_rows:
         text = row.get("text", "")
         embedding = row.get("embedding")
         if not text or not isinstance(embedding, list): continue
 
-        jaccard_score = 0.0 # Lexical score is not needed for this implementation
         vector_score = cos_sim(q_emb, embedding)
-        final_score = (alpha * jaccard_score) + ((1 - alpha) * vector_score)
+        lexical_score = 1 if any(token in text.lower() for token in q_tokens) else 0
+        final_score = (alpha * lexical_score) + ((1 - alpha) * vector_score)
         
         if final_score > 0.22:
             scored_docs.append((final_score, row))
-    
-    scored_docs.sort(key=lambda x: x[0], reverse=True)
 
-    # ★★★ DEBUG STATEMENTS ADDED HERE ★★★
-    print("\n--- [DEBUG] Hybrid Search Diagnostics ---")
-    print(f"[DEBUG] Query: '{query}'")
-    print("\n[DEBUG] Top 10 potential matches (before final selection):")
-    for i, (score, doc) in enumerate(scored_docs[:10]):
-        ref = doc.get('ref') or f"{doc.get('book', '')} {doc.get('chapter', '')}:{doc.get('verse', '')}".strip()
-        print(f"[DEBUG]   {i+1}. Score: {score:.4f} | Ref: {ref} | Text: '{doc.get('text', '')[:70]}...'")
-    print("--- [DEBUG] End Diagnostics ---\n")
-    
+    scored_docs.sort(key=lambda x: x[0], reverse=True)
     return [doc for score, doc in scored_docs[:top_k]]

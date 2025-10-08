@@ -11,7 +11,21 @@ EMBED_MODEL    = os.getenv("EMBED_MODEL", "text-embedding-3-small")
 
 # --- Chaplain Logic Keywords ---
 ASK_WORDS = {"verse", "scripture", "psalm", "quote", "passage", "bible"}
-DISTRESS_KEYWORDS = {"scared", "anxious", "worried", "nervous", "afraid", "stress"}
+
+# ★★★ EXPANDED KEYWORD LIST ★★★
+DISTRESS_KEYWORDS = {
+    # Fear / Anxiety
+    "scared", "anxious", "worried", "nervous", "afraid", "stress",
+    # Sadness / Loss
+    "sad", "grief", "hurting", "lost", "lonely", "heartbroken", "depressed",
+    # Anger / Frustration
+    "angry", "frustrated", "betrayed", "resentful", "bitter",
+    # Doubt / Uncertainty
+    "doubt", "confused", "uncertain", "conflicted",
+    # Weakness / Failure
+    "weak", "failure", "overwhelmed", "guilt", "shame", "stuck"
+}
+
 FAITH_KEYWORDS = {
     "catholic": "bible_nrsv",
     "christian": "bible_asv",
