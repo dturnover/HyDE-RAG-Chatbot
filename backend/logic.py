@@ -5,6 +5,9 @@ from dataclasses import dataclass, field
 import config
 import rag
 
+# Note: The OpenAI client is now needed here for the query rewrite
+client = rag.client
+
 @dataclass
 class SessionState:
     """A temporary object to hold state for a single request."""
@@ -19,7 +22,6 @@ class SessionState:
         return MockChap()
 
 def _edit_distance(s1: str, s2: str) -> int:
-    # ... (this function is unchanged)
     if len(s1) > len(s2): s1, s2 = s2, s1
     distances = range(len(s1) + 1)
     for i2, c2 in enumerate(s2):
@@ -30,17 +32,16 @@ def _edit_distance(s1: str, s2: str) -> int:
         distances = new_distances
     return distances[-1]
 
-SYSTEM_BASE_FLOW = """You are the Fight Chaplain...""" # (Unchanged)
+SYSTEM_BASE_FLOW = """You are the Fight Chaplain...""" # Omitted for brevity
 
 def system_message(s: SessionState, quote_allowed: bool, retrieval_ctx: Optional[str]) -> Dict[str, str]:
-    # ... (this function is unchanged)
     rag_instruction = ""
     if quote_allowed:
-        rag_instruction = "A relevant scripture has been provided... You MUST seamlessly weave a short, direct quote from this passage into your response..."
+        rag_instruction = "A relevant scripture has been provided in the context. You MUST seamlessly weave a short, direct quote from this passage into your response, followed by an em dash and the citation (e.g., — Isaiah 41:10)."
     elif s.faith:
-        rag_instruction = f"The user's faith is known ({s.faith}), but no scripture was retrieved... Provide an empathetic, practical response without inventing... scripture."
+        rag_instruction = f"The user's faith is known ({s.faith}), but no scripture was retrieved for this turn. Provide an empathetic, practical response without inventing or mentioning scripture."
     else:
-        rag_instruction = "The user's faith is UNKNOWN. Do not provide scripture..."
+        rag_instruction = "The user's faith is UNKNOWN. Do not provide scripture. Gently ask them to share their faith tradition if they are seeking scriptural support."
     session_status = f"SESSION STATUS: Faith set={s.faith or 'None'}. Quote is allowed={quote_allowed}."
     full_prompt = (f"{SYSTEM_BASE_FLOW}\n--- CONTEXT ---\n"
                    f"CURRENT SESSION STATUS: {session_status}\n"
@@ -49,7 +50,6 @@ def system_message(s: SessionState, quote_allowed: bool, retrieval_ctx: Optional
     return {"role": "system", "content": full_prompt}
 
 def try_set_faith(msg: str, s: SessionState) -> None:
-    # ... (this function is unchanged)
     if s.faith: return
     m = msg.lower()
     for keyword, faith_id in config.FAITH_KEYWORDS.items():
@@ -64,26 +64,40 @@ def try_set_faith(msg: str, s: SessionState) -> None:
                 return
 
 def wants_retrieval(msg: str) -> bool:
-    # ... (this function is unchanged)
     m_lower = msg.lower()
     return any(word in m_lower for word in config.ASK_WORDS | config.DISTRESS_KEYWORDS)
+
+def _get_rewritten_query(user_message: str) -> str:
+    """Uses a fast LLM call to rewrite the user's query for better RAG results."""
+    if not client: return user_message
+    try:
+        completion = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You are a search query generation expert. Rewrite the user's message into a concise, high-quality search query for finding relevant passages in a religious text database."},
+                {"role": "user", "content": user_message}
+            ],
+            temperature=0.0,
+            stream=False # We need the full response, not a stream
+        )
+        rewritten = completion.choices[0].message.content
+        return rewritten if rewritten else user_message
+    except Exception:
+        # If the rewrite fails for any reason, fall back to the original message
+        return user_message
 
 def get_rag_context(msg: str, s: SessionState) -> Optional[str]:
     should_retrieve = wants_retrieval(msg)
     faith_is_set = bool(s.faith)
 
     if should_retrieve and faith_is_set:
-        # ★★★ THE FIX IS HERE: QUERY TRANSFORMATION ★★★
-        transformed_query = msg
-        # Check if the message contains emotional keywords
-        if any(word in msg.lower() for word in config.DISTRESS_KEYWORDS):
-            # Rephrase the query to be more explicit about the user's need
-            transformed_query = f"Spiritual guidance for someone feeling {', '.join(config.DISTRESS_KEYWORDS)} and needing strength in their situation: {msg}"
+        # ★★★ LLM QUERY TRANSFORMATION ★★★
+        # First, rewrite the user's query into a better one.
+        rewritten_query = _get_rewritten_query(msg)
         
-        # Add a debug statement to see the final query
-        print(f"[DEBUG] Transformed RAG Query: '{transformed_query}'")
-
-        hits = rag.hybrid_search(transformed_query, s.faith)
+        # Then, use that rewritten query to perform the search.
+        hits = rag.hybrid_search(rewritten_query, s.faith)
+        
         if not hits:
             return None
 

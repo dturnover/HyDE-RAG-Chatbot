@@ -8,43 +8,7 @@ import config
 client = OpenAI(api_key=config.OPENAI_API_KEY) if config.OPENAI_API_KEY else None
 RAG_DATA_PATH = Path("/opt/render/project/src/indexes")
 
-# ★★★ EXPANDED SYNONYM MAP ★★★
-SYNONYM_MAP = {
-    # Fear / Anxiety
-    "nervous": {"fear", "afraid", "anxious", "courage", "strength", "worry", "peace"},
-    "anxious": {"fear", "afraid", "anxious", "courage", "strength", "worry", "peace"},
-    "scared":  {"fear", "afraid", "anxious", "courage", "strength", "worry", "peace"},
-    "afraid":  {"fear", "afraid", "anxious", "courage", "strength", "worry", "peace"},
-    "worried": {"fear", "afraid", "anxious", "courage", "strength", "worry", "peace"},
-    "stress":  {"burden", "peace", "rest", "anxious", "worry", "strength"},
-    # Sadness / Loss
-    "sad":       {"sorrow", "mourn", "weep", "comfort", "joy", "despair", "broken", "spirit"},
-    "grief":     {"sorrow", "mourn", "weep", "comfort", "death", "loss"},
-    "hurting":   {"heal", "pain", "suffer", "broken", "comfort", "refuge"},
-    "lost":      {"found", "guide", "way", "path", "seek", "shepherd"},
-    "lonely":    {"alone", "comfort", "friend", "presence", "god", "lord"},
-    "heartbroken": {"heal", "broken", "heart", "comfort", "sorrow", "love"},
-    "depressed": {"despair", "hope", "lift", "spirit", "light", "darkness"},
-    # Anger / Frustration
-    "angry":       {"anger", "wrath", "rage", "forgive", "patience", "peace", "justice"},
-    "frustrated":  {"patience", "peace", "anger", "rest", "striving"},
-    "betrayed":    {"trust", "friend", "forgive", "love", "justice", "enemy"},
-    "resentful":   {"bitter", "forgive", "heart", "love", "peace"},
-    "bitter":      {"bitter", "forgive", "heart", "love", "peace"},
-    # Doubt / Uncertainty
-    "doubt":     {"faith", "believe", "trust", "wisdom", "understanding", "seek"},
-    "confused":  {"wisdom", "guidance", "understanding", "light", "path", "clarity"},
-    "uncertain": {"faith", "trust", "hope", "guide", "future", "path"},
-    "conflicted": {"peace", "heart", "mind", "wisdom", "guide"},
-    # Weakness / Failure
-    "weak":        {"strength", "power", "strong", "lift", "spirit", "grace"},
-    "failure":     {"fail", "fall", "rise", "grace", "forgive", "mercy", "redeem"},
-    "overwhelmed": {"burden", "rest", "peace", "strength", "help", "refuge"},
-    "guilt":       {"sin", "forgive", "mercy", "cleanse", "grace", "redeem"},
-    "shame":       {"sin", "forgive", "mercy", "honor", "grace", "glory"},
-    "stuck":       {"free", "deliver", "path", "way", "hope"},
-}
-
+# SYNONYM_MAP has been removed.
 
 def embed_query(text: str) -> Optional[List[float]]:
     if not client: return None
@@ -64,43 +28,54 @@ def cos_sim(a: List[float], b: List[float]) -> float:
     return dot_product / (norm_a * norm_b) if norm_a > 0 and norm_b > 0 else 0.0
 
 def hybrid_search(query: str, corpus_name: str, top_k: int = 5) -> List[Dict[str, Any]]:
+    print("\n--- [DEBUG] Entering hybrid_search ---")
+    print(f"[DEBUG rag.py] Received query for search: '{query}'")
+
     file_name = f"{corpus_name}.jsonl"
     path = RAG_DATA_PATH / file_name
-    if not path.exists(): return []
+    if not path.exists(): 
+        print(f"[DEBUG rag.py] ERROR: Corpus path not found at: {path}")
+        return []
 
+    # Get tokens and embedding from the (already rewritten) query
     q_tokens = tokenize(query)
     q_emb = embed_query(query)
-    if not q_emb: return []
+    if not q_emb: 
+        print("[DEBUG rag.py] ERROR: Failed to create embedding for query.")
+        return []
 
-    search_tokens = set(q_tokens)
-    for token in q_tokens:
-        if token in SYNONYM_MAP:
-            search_tokens.update(SYNONYM_MAP[token])
+    print(f"[DEBUG rag.py] Tokens for Pass 1 (keyword scan): {q_tokens}")
 
+    # --- Fast First Pass: Candidate Selection ---
     candidate_rows = []
     with path.open("r", encoding="utf-8") as f:
         for line in f:
-            if any(token in line.lower() for token in search_tokens):
+            if any(token in line.lower() for token in q_tokens):
                 try:
                     candidate_rows.append(json.loads(line))
                 except json.JSONDecodeError:
                     continue
     
-    if not candidate_rows: return []
+    print(f"[DEBUG rag.py] Pass 1 (keyword scan) found {len(candidate_rows)} candidates.")
+    if not candidate_rows:
+        print("--- [DEBUG] Leaving hybrid_search (no candidates found) ---\n")
+        return []
 
-    alpha = 0.05
+    # --- Slow Second Pass: Vector Search on Candidates ---
     scored_docs = []
     for row in candidate_rows:
-        text = row.get("text", "")
         embedding = row.get("embedding")
-        if not text or not isinstance(embedding, list): continue
+        if isinstance(embedding, list):
+            vector_score = cos_sim(q_emb, embedding)
+            if vector_score > 0.3: # Using a higher threshold for the smaller candidate set
+                scored_docs.append((vector_score, row))
 
-        vector_score = cos_sim(q_emb, embedding)
-        lexical_score = 1 if any(token in text.lower() for token in q_tokens) else 0
-        final_score = (alpha * lexical_score) + ((1 - alpha) * vector_score)
-        
-        if final_score > 0.22:
-            scored_docs.append((final_score, row))
-
+    print(f"[DEBUG rag.py] Pass 2 (vector search) found {len(scored_docs)} matches above threshold.")
+    
     scored_docs.sort(key=lambda x: x[0], reverse=True)
-    return [doc for score, doc in scored_docs[:top_k]]
+    
+    final_results = [doc for score, doc in scored_docs[:top_k]]
+    print(f"[DEBUG rag.py] Returning top {len(final_results)} results.")
+    print("--- [DEBUG] Leaving hybrid_search ---\n")
+    
+    return final_results
