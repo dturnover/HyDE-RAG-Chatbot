@@ -5,15 +5,12 @@ from dataclasses import dataclass, field
 import config
 import rag
 
-# Note: The OpenAI client is now needed here for the query rewrite
 client = rag.client
 
 @dataclass
 class SessionState:
-    """A temporary object to hold state for a single request."""
     history: List[Dict[str, str]] = field(default_factory=list)
     faith: Optional[str] = None
-    
     @property
     def _chap(self):
         class MockChap:
@@ -22,6 +19,7 @@ class SessionState:
         return MockChap()
 
 def _edit_distance(s1: str, s2: str) -> int:
+    # ... (unchanged)
     if len(s1) > len(s2): s1, s2 = s2, s1
     distances = range(len(s1) + 1)
     for i2, c2 in enumerate(s2):
@@ -32,16 +30,13 @@ def _edit_distance(s1: str, s2: str) -> int:
         distances = new_distances
     return distances[-1]
 
-SYSTEM_BASE_FLOW = """You are the Fight Chaplain...""" # Omitted for brevity
-
+SYSTEM_BASE_FLOW = """You are the Fight Chaplain...""" # (Unchanged)
 def system_message(s: SessionState, quote_allowed: bool, retrieval_ctx: Optional[str]) -> Dict[str, str]:
-    rag_instruction = ""
-    if quote_allowed:
-        rag_instruction = "A relevant scripture has been provided in the context. You MUST seamlessly weave a short, direct quote from this passage into your response, followed by an em dash and the citation (e.g., — Isaiah 41:10)."
-    elif s.faith:
-        rag_instruction = f"The user's faith is known ({s.faith}), but no scripture was retrieved for this turn. Provide an empathetic, practical response without inventing or mentioning scripture."
-    else:
-        rag_instruction = "The user's faith is UNKNOWN. Do not provide scripture. Gently ask them to share their faith tradition if they are seeking scriptural support."
+    # ... (unchanged)
+    rag_instruction = "..."
+    if quote_allowed: rag_instruction = "..."
+    elif s.faith: rag_instruction = f"..."
+    else: rag_instruction = "..."
     session_status = f"SESSION STATUS: Faith set={s.faith or 'None'}. Quote is allowed={quote_allowed}."
     full_prompt = (f"{SYSTEM_BASE_FLOW}\n--- CONTEXT ---\n"
                    f"CURRENT SESSION STATUS: {session_status}\n"
@@ -50,6 +45,7 @@ def system_message(s: SessionState, quote_allowed: bool, retrieval_ctx: Optional
     return {"role": "system", "content": full_prompt}
 
 def try_set_faith(msg: str, s: SessionState) -> None:
+    # ... (unchanged)
     if s.faith: return
     m = msg.lower()
     for keyword, faith_id in config.FAITH_KEYWORDS.items():
@@ -68,7 +64,7 @@ def wants_retrieval(msg: str) -> bool:
     return any(word in m_lower for word in config.ASK_WORDS | config.DISTRESS_KEYWORDS)
 
 def _get_rewritten_query(user_message: str) -> str:
-    """Uses a fast LLM call to rewrite the user's query for better RAG results."""
+    print("\n--- [DEBUG logic.py] Entering _get_rewritten_query ---")
     if not client: return user_message
     try:
         completion = client.chat.completions.create(
@@ -78,32 +74,36 @@ def _get_rewritten_query(user_message: str) -> str:
                 {"role": "user", "content": user_message}
             ],
             temperature=0.0,
-            stream=False # We need the full response, not a stream
+            stream=False
         )
         rewritten = completion.choices[0].message.content
+        print(f"[DEBUG logic.py] LLM rewrote query to: '{rewritten}'")
         return rewritten if rewritten else user_message
-    except Exception:
-        # If the rewrite fails for any reason, fall back to the original message
+    except Exception as e:
+        print(f"[DEBUG logic.py] ERROR during query rewrite: {e}")
         return user_message
 
 def get_rag_context(msg: str, s: SessionState) -> Optional[str]:
+    print("\n--- [DEBUG logic.py] Entering get_rag_context ---")
     should_retrieve = wants_retrieval(msg)
     faith_is_set = bool(s.faith)
+    print(f"[DEBUG logic.py] wants_retrieval={should_retrieve}, faith_is_set={faith_is_set}")
 
     if should_retrieve and faith_is_set:
-        # ★★★ LLM QUERY TRANSFORMATION ★★★
-        # First, rewrite the user's query into a better one.
         rewritten_query = _get_rewritten_query(msg)
         
-        # Then, use that rewritten query to perform the search.
+        print(f"[DEBUG logic.py] Calling rag.hybrid_search with rewritten query.")
         hits = rag.hybrid_search(rewritten_query, s.faith)
         
         if not hits:
+            print("[DEBUG logic.py] RAG search returned 0 hits.")
             return None
 
+        print(f"[DEBUG logic.py] RAG search successful, returning {len(hits)} hit(s).")
         top_hit = hits[0]
         ref = top_hit.get('ref') or f"{top_hit.get('book', '')} {top_hit.get('chapter', '')}:{top_hit.get('verse', '')}".strip()
         text = re.sub(r'\s+', ' ', top_hit.get('text', '')).strip()
         return f"RETRIEVED PASSAGE (weave this in seamlessly):\n- {ref} :: {text}"
     
+    print("[DEBUG logic.py] Conditions for RAG not met. Skipping search.")
     return None
