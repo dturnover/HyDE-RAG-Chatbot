@@ -1,11 +1,10 @@
 # logic.py
 import re
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Iterable
 from dataclasses import dataclass, field
 import config
 import rag
 
-# The OpenAI client is needed here for the query rewrite
 client = rag.client
 
 @dataclass
@@ -33,6 +32,28 @@ def _edit_distance(s1: str, s2: str) -> int:
         distances = new_distances
     return distances[-1]
 
+def _check_for_keywords_with_typo_tolerance(msg: str, keywords: Iterable[str]) -> Optional[str]:
+    """
+    Checks a message for a list of keywords with typo tolerance.
+    Returns the matched keyword if found, otherwise None.
+    """
+    m = msg.lower()
+    
+    # Step 1: Fast, exact whole-word match.
+    for keyword in keywords:
+        if re.search(r'\b' + re.escape(keyword) + r'\b', m):
+            return keyword
+            
+    # Step 2: Slower, typo-tolerant check if no exact match was found.
+    msg_tokens = set(re.findall(r'\w+', m))
+    for keyword in keywords:
+        for token in msg_tokens:
+            # Only check for typos on words of similar length for efficiency
+            if abs(len(token) - len(keyword)) <= 2 and _edit_distance(token, keyword) <= 1:
+                return keyword # Return the original keyword, not the user's typo
+    
+    return None
+
 SYSTEM_BASE_FLOW = """You are the Fight Chaplain, a professional, empathetic, and strictly non-denominational spiritual guide. Your purpose is to support a person navigating stressful situations by weaving in relevant scripture when their faith is known."""
 
 def system_message(s: SessionState, quote_allowed: bool, retrieval_ctx: Optional[str]) -> Dict[str, str]:
@@ -53,21 +74,14 @@ def system_message(s: SessionState, quote_allowed: bool, retrieval_ctx: Optional
 
 def try_set_faith(msg: str, s: SessionState) -> None:
     if s.faith: return
-    m = msg.lower()
-    for keyword, faith_id in config.FAITH_KEYWORDS.items():
-        if re.search(r'\b' + re.escape(keyword) + r'\b', m):
-            s.faith = faith_id
-            return
-    msg_tokens = set(re.findall(r'\w+', m))
-    for keyword, faith_id in config.FAITH_KEYWORDS.items():
-        for token in msg_tokens:
-            if abs(len(token) - len(keyword)) <= 2 and _edit_distance(token, keyword) <= 1:
-                s.faith = faith_id
-                return
+    
+    matched_keyword = _check_for_keywords_with_typo_tolerance(msg, config.FAITH_KEYWORDS.keys())
+    if matched_keyword:
+        s.faith = config.FAITH_KEYWORDS[matched_keyword]
 
 def wants_retrieval(msg: str) -> bool:
-    m_lower = msg.lower()
-    return any(word in m_lower for word in config.ASK_WORDS | config.DISTRESS_KEYWORDS)
+    all_trigger_keywords = config.ASK_WORDS | config.DISTRESS_KEYWORDS
+    return _check_for_keywords_with_typo_tolerance(msg, all_trigger_keywords) is not None
 
 def _get_rewritten_query(user_message: str) -> str:
     """Uses a fast LLM call to rewrite the user's query for better RAG results."""
@@ -88,41 +102,29 @@ def _get_rewritten_query(user_message: str) -> str:
         return user_message
 
 def get_rag_context(msg: str, s: SessionState) -> Optional[str]:
-    should_retrieve = wants_retrieval(msg)
-    faith_is_set = bool(s.faith)
-
-    if should_retrieve and faith_is_set:
+    if wants_retrieval(msg) and s.faith:
         rewritten_query = _get_rewritten_query(msg)
         hits = rag.hybrid_search(rewritten_query, s.faith)
         if not hits: return None
 
-        # --- Data Quality Checks ---
-        # 1. Try to find the first good hit that has substantial text.
         good_hit = None
         for hit in hits:
             text = hit.get('text', '').strip()
-            # Ensure the text is not just a title/summary (at least 5 words)
             if len(text.split()) >= 5:
                 good_hit = hit
                 break
         
-        # If no good hits were found, abort.
-        if not good_hit:
-            return None
+        if not good_hit: return None
 
-        # 2. Clean up the reference from the good hit.
-        ref = good_hit.get('ref', 'Unknown Reference').strip()
-        ref = re.sub(r'(\d+)$', r'', ref) # Turns "Luke 12:157" into "Luke 12:15"
+        ref = good_hit.get('ref', 'Unknown').strip()
+        ref = re.sub(r'(\d+)$', r'', ref)
         text = good_hit.get('text', '').strip()
 
         return f"RETRIEVED PASSAGE:\n- Reference: {ref}\n- Text: \"{text}\""
-    
     return None
 
 def update_session_metrics(msg: str, s: SessionState) -> None:
-    # Placeholder for future logic, like escalation
     pass
 
 def apply_referral_footer(text: str, s: SessionState) -> str:
-    # Placeholder for future logic
     return text
