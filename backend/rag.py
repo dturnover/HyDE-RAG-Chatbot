@@ -1,6 +1,6 @@
 # rag.py
 # Handles Retrieval-Augmented Generation using Pinecone.
-# Fixed OpenAI client variable name to `client` for compatibility with logic.py.
+# Added debug logging to show top 5 candidates from Pinecone.
 import os
 import re
 from openai import OpenAI
@@ -14,7 +14,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # Important: Ensure OPENAI_API_KEY, PINECONE_API_KEY, and PINECONE_INDEX_NAME
 # are set as environment variables in your deployment environment (e.g., Render).
 try:
-    # ★★★ Fix: Use the variable name 'client' as expected by logic.py ★★★
+    # Use the variable name 'client' as expected by logic.py
     client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
     pinecone_api_key = os.environ.get("PINECONE_API_KEY")
     pinecone_index_name = os.environ.get("PINECONE_INDEX_NAME")
@@ -100,7 +100,8 @@ def pinecone_search(query_embedding, faith_filter, top_k=5): # Using top_k=5 as 
                 if text and reference:
                     results_list.append({"text": text, "ref": reference, "score": score})
                 else: logging.warning(f"Match (ID: {match.get('id')}) missing text/ref metadata.")
-            results_list.sort(key=lambda x: x['score'], reverse=True)
+            # Pinecone results are typically sorted by score already, but sorting doesn't hurt
+            # results_list.sort(key=lambda x: x['score'], reverse=True) # Optional re-sort
             return results_list
         else:
             logging.info("No relevant matches found in Pinecone."); return []
@@ -131,19 +132,37 @@ def find_relevant_scripture(transformed_query: str, faith_context: str) -> tuple
 
     search_results = pinecone_search(query_embedding, faith_context, top_k=5)
 
+    # ★★★ ADDED DEBUGGING BLOCK ★★★
     if search_results:
+        logging.info("--- Top 5 Pinecone Candidates ---")
+        for i, result in enumerate(search_results):
+            logging.info(f"{i+1}. Ref: {result.get('ref', 'N/A')}, Score: {result.get('score', 0.0):.4f}, Text: '{result.get('text', '')[:80]}...'")
+        logging.info("--- End Candidates ---")
+    else:
+        logging.info("Pinecone returned no candidates.")
+    # ★★★ END DEBUGGING BLOCK ★★★
+
+    if search_results:
+        # Iterate through results to find the first one that passes quality checks
         for best_match in search_results:
-            best_text = best_match.get('text'); best_ref = best_match.get('ref')
+            best_text = best_match.get('text')
+            best_ref = best_match.get('ref')
+
             if best_text and best_ref:
                 cleaned_text = clean_verse(best_text)
-                if len(cleaned_text.split()) >= 5: # Quality check
-                    logging.info(f"Search complete. Match: {best_ref} (Score: {best_match.get('score', 0.0):.4f})")
+                # Quality check: ensure text is reasonably long
+                if len(cleaned_text.split()) >= 5:
+                    logging.info(f"Search complete. Selected valid match: {best_ref} (Score: {best_match.get('score', 0.0):.4f})")
                     return cleaned_text, best_ref
-                else: logging.info(f"Skipping short match: {best_ref}")
-            else: logging.warning("Match missing text or ref.")
-        logging.info("No suitable long-enough match found in top results.")
+                else:
+                     logging.info(f"Skipping short match from candidates: {best_ref} (Text: '{cleaned_text[:50]}...')")
+            else:
+                 logging.warning("Candidate match from Pinecone was missing text or ref.")
+
+        # If loop finishes without finding a good match
+        logging.info("No suitable long-enough scripture found among top Pinecone candidates.")
         return None, None
     else:
-        logging.info("No scripture found from Pinecone search.")
+        logging.info("No scripture found from Pinecone search (initial query returned empty).")
         return None, None
 
