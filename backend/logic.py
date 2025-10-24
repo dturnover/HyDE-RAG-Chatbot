@@ -1,18 +1,19 @@
 # logic.py
+# Updated to call rag.find_relevant_scripture (which uses Pinecone)
 import re
 from typing import Dict, List, Optional, Iterable
 from dataclasses import dataclass, field
 import config
-import rag
+import rag # Imports the updated rag module
 
-client = rag.client
+client = rag.client # Use the client initialized in rag.py
 
 @dataclass
 class SessionState:
     """A temporary object to hold state for a single request."""
     history: List[Dict[str, str]] = field(default_factory=list)
     faith: Optional[str] = None
-    
+
     @property
     def _chap(self):
         class MockChap:
@@ -38,93 +39,129 @@ def _check_for_keywords_with_typo_tolerance(msg: str, keywords: Iterable[str]) -
     Returns the matched keyword if found, otherwise None.
     """
     m = msg.lower()
-    
+
     # Step 1: Fast, exact whole-word match.
     for keyword in keywords:
         if re.search(r'\b' + re.escape(keyword) + r'\b', m):
             return keyword
-            
+
     # Step 2: Slower, typo-tolerant check if no exact match was found.
     msg_tokens = set(re.findall(r'\w+', m))
     for keyword in keywords:
+        # Allow slightly more difference for longer words? Maybe not needed.
+        max_diff = 1 if len(keyword) <= 6 else 2 # Allow 1 diff for short, 2 for longer
+        len_tolerance = 2 # Allow length diff up to 2
+
         for token in msg_tokens:
             # Only check for typos on words of similar length for efficiency
-            if abs(len(token) - len(keyword)) <= 2 and _edit_distance(token, keyword) <= 1:
+            if abs(len(token) - len(keyword)) <= len_tolerance and _edit_distance(token, keyword) <= max_diff:
                 return keyword # Return the original keyword, not the user's typo
-    
+
     return None
 
 SYSTEM_BASE_FLOW = """You are the Fight Chaplain, a professional, empathetic, and strictly non-denominational spiritual guide. Your purpose is to support a person navigating stressful situations by weaving in relevant scripture when their faith is known."""
 
 def system_message(s: SessionState, quote_allowed: bool, retrieval_ctx: Optional[str]) -> Dict[str, str]:
+    """Generates the system message based on session state and RAG results."""
     rag_instruction = ""
-    if quote_allowed:
-        rag_instruction = "A relevant scripture has been provided in the context below. You MUST seamlessly weave a short, direct quote from this passage's 'text' into your response. Your quote must be enclosed in quotation marks. After the quote, you MUST cite it using an em dash (e.g., — Isaiah 41:10)."
+    if quote_allowed and retrieval_ctx: # Ensure context exists if quote allowed
+        rag_instruction = ("A relevant scripture has been provided in the context below. "
+                           "You MUST seamlessly weave a short, direct quote from this passage's 'text' into your response. "
+                           "Your quote must be enclosed in quotation marks. "
+                           "After the quote, you MUST cite it using an em dash (e.g., — Isaiah 41:10).")
     elif s.faith:
-        rag_instruction = f"The user's faith is known ({s.faith}), but no scripture was retrieved for this turn. Provide an empathetic, practical response without inventing or mentioning scripture."
+        rag_instruction = (f"The user's faith is known ({s.faith}), but no suitable scripture was retrieved for this turn. "
+                           "Provide an empathetic, practical response without inventing or mentioning scripture.")
     else:
-        rag_instruction = "The user's faith is UNKNOWN. Do not provide scripture. Gently ask them to share their faith tradition if they are seeking scriptural support."
-    
-    session_status = f"SESSION STATUS: Faith set={s.faith or 'None'}. Quote is allowed={quote_allowed}."
+        rag_instruction = ("The user's faith is UNKNOWN. Do not provide scripture. "
+                           "Gently ask them to share their faith tradition if they are seeking scriptural support.")
+
+    session_status = f"Faith set={s.faith or 'None'}. Quote allowed={quote_allowed and bool(retrieval_ctx)}."
     full_prompt = (f"{SYSTEM_BASE_FLOW}\n--- CONTEXT ---\n"
                    f"CURRENT SESSION STATUS: {session_status}\n"
                    f"RAG RULE: {rag_instruction}\n"
                    f"{retrieval_ctx or 'No passages retrieved.'}\n")
     return {"role": "system", "content": full_prompt}
 
-def try_set_faith(msg: str, s: SessionState) -> None:
-    if s.faith: return
-    
+def try_set_faith(msg: str, s: SessionState) -> bool:
+    """Attempts to set faith based on keywords. Returns True if faith was newly set."""
+    if s.faith: return False # Don't change if already set
+
     matched_keyword = _check_for_keywords_with_typo_tolerance(msg, config.FAITH_KEYWORDS.keys())
     if matched_keyword:
         s.faith = config.FAITH_KEYWORDS[matched_keyword]
+        print(f"[DEBUG logic.py] Faith set to: {s.faith} based on keyword '{matched_keyword}'")
+        return True
+    return False
 
 def wants_retrieval(msg: str) -> bool:
+    """Checks if the message likely requests or implies a need for scripture."""
     all_trigger_keywords = config.ASK_WORDS | config.DISTRESS_KEYWORDS
-    return _check_for_keywords_with_typo_tolerance(msg, all_trigger_keywords) is not None
+    match = _check_for_keywords_with_typo_tolerance(msg, all_trigger_keywords)
+    print(f"[DEBUG logic.py] wants_retrieval check on '{msg[:50]}...': Match = {match}")
+    return match is not None
 
 def _get_rewritten_query(user_message: str) -> str:
     """Uses a fast LLM call to rewrite the user's query for better RAG results."""
-    if not client: return user_message
+    if not client:
+         print("[DEBUG logic.py] OpenAI client not available, returning original query.")
+         return user_message
+    print(f"[DEBUG logic.py] Rewriting query: '{user_message}'")
     try:
         completion = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4o-mini", # Use a fast model
             messages=[
-                {"role": "system", "content": "You are a search query generation expert. Rewrite the user's message into a concise, high-quality search query for finding relevant passages in a religious text database."},
+                {"role": "system", "content": ("Rewrite the user's message into a concise, high-quality search query "
+                                               "for finding relevant passages in a religious text database about providing comfort or strength "
+                                               "for challenges, stress, or negative emotions. Focus on keywords and concepts.")},
                 {"role": "user", "content": user_message}
             ],
             temperature=0.0,
+            max_tokens=50, # Keep it short
             stream=False
         )
         rewritten = completion.choices[0].message.content
-        return rewritten if rewritten else user_message
-    except Exception:
-        return user_message
+        print(f"[DEBUG logic.py] Rewritten query: '{rewritten}'")
+        # Strip leading/trailing quotes sometimes added by LLM
+        rewritten_clean = rewritten.strip().strip('"').strip("'")
+        return rewritten_clean if rewritten_clean else user_message
+    except Exception as e:
+         print(f"[DEBUG logic.py] ERROR during query rewrite: {e}")
+         return user_message # Fallback to original query on error
 
 def get_rag_context(msg: str, s: SessionState) -> Optional[str]:
+    """
+    Determines if RAG is needed, performs query rewrite, calls Pinecone search,
+    and formats the result for the system prompt context.
+    """
+    # ★★★ MODIFIED SECTION ★★★
     if wants_retrieval(msg) and s.faith:
+        print(f"[DEBUG logic.py] Retrieval triggered for faith: {s.faith}")
         rewritten_query = _get_rewritten_query(msg)
-        hits = rag.hybrid_search(rewritten_query, s.faith)
-        if not hits: return None
 
-        good_hit = None
-        for hit in hits:
-            text = hit.get('text', '').strip()
-            if len(text.split()) >= 5:
-                good_hit = hit
-                break
-        
-        if not good_hit: return None
+        # Call the updated RAG function that uses Pinecone
+        # It now returns the single best valid result (text, ref) or (None, None)
+        verse_text, verse_ref = rag.find_relevant_scripture(rewritten_query, s.faith)
 
-        ref = good_hit.get('ref', 'Unknown').strip()
-        ref = re.sub(r'(\d+)$', r'', ref)
-        text = good_hit.get('text', '').strip()
-
-        return f"RETRIEVED PASSAGE:\n- Reference: {ref}\n- Text: \"{text}\""
-    return None
+        if verse_text and verse_ref:
+            # rag.find_relevant_scripture already cleans the text and ref
+            print(f"[DEBUG logic.py] RAG context generated: Ref='{verse_ref}', Text='{verse_text[:50]}...'")
+            # Format exactly as needed by system_message
+            return f"RETRIEVED PASSAGE:\n- Reference: {verse_ref}\n- Text: \"{verse_text}\""
+        else:
+             print("[DEBUG logic.py] rag.find_relevant_scripture returned no valid hit.")
+             return None
+    else:
+        print("[DEBUG logic.py] Retrieval not triggered (faith unknown or no trigger words).")
+        return None
+    # ★★★ END OF MODIFIED SECTION ★★★
 
 def update_session_metrics(msg: str, s: SessionState) -> None:
+    """Placeholder for potential future metrics/logging."""
     pass
 
 def apply_referral_footer(text: str, s: SessionState) -> str:
+    """Placeholder for adding referral info if needed."""
+    # Example: Check s._chap.escalate and append footer if needed
     return text
+
