@@ -1,14 +1,15 @@
 # tools/chunker.py
 # Final Correction: Fixed Dhammapada parser to use ASCII hyphen in IDs.
+# REVISION 4: Rewrote 'parse_nrsv_bible' AGAIN. v3 failed on "I am".
+# REVISION 2: Rewrote 'parse_tanakh' to fix verse-merging bugs.
 import sys
 import json
 import re
 import argparse
 import os
-from typing import Dict, TextIO # Corrected import
+from typing import Dict, TextIO
 
 # --- Data for Reference Checks ---
-# ... (BIBLE_CHAPTER_LIMITS, QURAN_CHAPTER_LIMITS - unchanged) ...
 TANAKH_BOOKS = [
     "Genesis", "Exodus", "Leviticus", "Numbers", "Deuteronomy",
     "Joshua", "Judges", "1 Samuel", "2 Samuel", "1 Kings", "2 Kings",
@@ -59,7 +60,7 @@ QURAN_CHAPTER_LIMITS = 114 # Max Surah number
 
 
 # --- Utility Functions ---
-def write(out: TextIO, row: Dict): # Added TextIO hint back
+def write(out: TextIO, row: Dict):
     """Writes a dictionary as a JSON line to the output file."""
     out.write(json.dumps(row, ensure_ascii=False) + "\n")
 
@@ -69,7 +70,6 @@ def write(out: TextIO, row: Dict): # Added TextIO hint back
 # (Confirmed working - No changes needed)
 def parse_asv_bible(inp: str, source: str, out: TextIO):
     print(f"Using dedicated parser: parse_asv_bible...")
-    # ... [rest of parse_asv_bible - unchanged] ...
     cur_book = ""
     current_ref_parts = None
     current_text = ""
@@ -132,162 +132,255 @@ def parse_asv_bible(inp: str, source: str, out: TextIO):
 
 
 # --- 2. Parser for corpus/nrsv_bible.txt ---
-# (Confirmed working - No changes needed)
+# (START OF REWRITTEN SECTION v4)
+
+# Helper function to parse chapter/verse numbers (int or roman)
+def _parse_roman_or_int(num_str: str) -> int:
+    """Parses a string that is either an integer or a Roman numeral."""
+    num_str = num_str.strip().lower()
+    if num_str.isdigit():
+        try:
+            return int(num_str)
+        except ValueError:
+            return 0
+    
+    roman_map = {'i': 1, 'v': 5, 'x': 10, 'l': 50, 'c': 100, 'd': 500, 'm': 1000}
+    val = 0
+    prev_val = 0
+    for n in reversed(num_str):
+        if n not in roman_map:
+            return 0 # Invalid roman numeral
+        curr = roman_map[n]
+        val += curr if curr >= prev_val else -curr
+        prev_val = curr
+    return val
+
+# Helper function to write the buffered verse
+def _write_nrsv_verse(out: TextIO, source: str, book: str, chap: int, verse_num: int, text_buffer: str) -> int:
+    """Writes the buffered verse text to the output file if valid."""
+    if book and chap > 0 and verse_num > 0 and text_buffer:
+        cleaned_text = re.sub(r'\s+', ' ', text_buffer).strip()
+        if cleaned_text:
+            row = {
+                "id": f"{source}-{book.replace(' ', '_')}-{chap}-{verse_num}",
+                "source": source,
+                "ref": f"{book} {chap}:{verse_num}",
+                "book": book,
+                "chapter": chap,
+                "verse": verse_num,
+                "text": cleaned_text
+            }
+            write(out, row) # Use the global 'write' function
+            return 1
+    return 0
+
+
 def parse_nrsv_bible(inp: str, source: str, out: TextIO):
-    print(f"Using dedicated parser: parse_nrsv_bible (FINAL)...")
+    print(f"Using dedicated parser: parse_nrsv_bible (REWRITTEN v4 - Dual-Regex)...")
     cur_book = ""
     cur_chapter = 0
-    current_verse_num = 0 # Track the *last* verse number found
-    # Stricter regex for chapter markers: [BookName ChapterNumOrRoman]
-    chapter_marker_re = re.compile(r'^\s*\[([A-Za-z\s.-]+?)\s+([0-9ivxlcdm]+)\]\s*$', re.IGNORECASE)
-    # Regex for verse lines starting with a number (captures number and text separately)
-    verse_line_re = re.compile(r'^\s*(\d+)\s+(.*)')
-    # Regex to find verse numbers starting a line OR preceded by space
-    verse_num_finder_re = re.compile(r'(?:^|\s)(\d+)\s')
+    cur_verse_num = 0
+    current_text_buffer = ""
     count = 0
-    found_first_chapter = False
-    current_line_text_buffer = "" # Accumulate text across lines until a new verse/chapter
+
+    chapter_marker_re = re.compile(r'^\s*\[([A-Za-z\s.-]+?)\s+([0-9ivxlcdm]+)\]\s*$', re.IGNORECASE)
+    # Regex for verse lines *starting* with a number (digits OR roman)
+    verse_line_re = re.compile(r'^\s*([ivxlcdm\d]+)\s+(.*)', re.IGNORECASE)
+    # Regex for *in-line* verse numbers (DIGITS ONLY)
+    inline_verse_marker_re = re.compile(r'\s(\d+)\s+')
+    # Regex for page headers/footers (e.g., "GENESIS 32" or "31")
+    page_junk_re = re.compile(r'^\s*(\d+\s+[A-Z\s]+|[A-Z\s]+\s+\d+)\s*$|^\s*\d+\s*$')
 
     try:
         with open(inp, "r", encoding="utf-8", errors="ignore") as f:
             for line_num, line in enumerate(f):
                 line_stripped = line.strip()
-                if not line_stripped: continue
-
-                chap_match = chapter_marker_re.match(line_stripped)
-                if chap_match:
-                    if found_first_chapter and cur_book and cur_chapter > 0 and current_verse_num > 0 and current_line_text_buffer:
-                        cleaned_text = re.sub(r'\s+', ' ', current_line_text_buffer).strip()
-                        if current_verse_num > 0:
-                            row = { "id": f"{source}-{cur_book}-{cur_chapter}-{current_verse_num}", "source": source, "ref": f"{cur_book} {cur_chapter}:{current_verse_num}", "book": cur_book, "chapter": cur_chapter, "verse": current_verse_num, "text": cleaned_text }
-                            write(out, row); count += 1
-                    found_first_chapter = True
-                    book_name, chap_str = chap_match.groups()
-                    cur_book = book_name.strip().title()
-                    cur_book = re.sub(r'^(\d)\s', r'\1 ', cur_book)
-                    if chap_str.lower() == 'i': cur_chapter = 1
-                    else:
-                         try: cur_chapter = int(chap_str)
-                         except ValueError:
-                              roman_map={'i':1,'v':5,'x':10,'l':50,'c':100,'d':500,'m':1000}; val=0; prev_val=0; valid=True
-                              for n in reversed(chap_str.lower()):
-                                   if n not in roman_map: valid=False; break
-                                   curr=roman_map[n]; val += curr if curr>=prev_val else -curr; prev_val=curr
-                              if valid: cur_chapter = val
-                              else: print(f"> WARN: Bad chap '{chap_str}' L{line_num+1}"); cur_chapter=0
-                    current_verse_num = 0; current_line_text_buffer = ""
+                if not line_stripped:
                     continue
 
-                if not found_first_chapter: continue # Skip lines until first chapter found
+                # 1. Check for Chapter Marker
+                chap_match = chapter_marker_re.match(line_stripped)
+                if chap_match:
+                    count += _write_nrsv_verse(out, source, cur_book, cur_chapter, cur_verse_num, current_text_buffer)
+                    book_name, chap_str = chap_match.groups()
+                    cur_book = book_name.strip().title()
+                    cur_book = re.sub(r'^(\d)\s', r'\1 ', cur_book) # Fix "1 Samuel"
+                    cur_chapter = _parse_roman_or_int(chap_str)
+                    cur_verse_num = 0
+                    current_text_buffer = ""
+                    if cur_chapter == 0:
+                         print(f"> WARN: Bad chap '{chap_str}' L{line_num+1}")
+                    continue
 
+                # Skip lines until first chapter is found
+                if not cur_book or cur_chapter == 0:
+                    continue 
+
+                # 2. Skip page headers/footers
+                if page_junk_re.match(line_stripped):
+                    continue
+
+                line_to_process = line_stripped
+                new_verse_started_on_line = False
+
+                # 3. Check for Line-Starting Verse (like 'i In the beginning...')
+                verse_line_match = verse_line_re.match(line_stripped)
+                if verse_line_match:
+                    verse_num_str, rest_of_line = verse_line_match.groups()
+                    new_verse_num = _parse_roman_or_int(verse_num_str)
+                    
+                    if new_verse_num == 0: # Bad parse, treat as text
+                         if cur_verse_num > 0: current_text_buffer += " " + line_stripped
+                         continue # Skip rest of processing
+                    
+                    # This is a valid line-starting verse
+                    count += _write_nrsv_verse(out, source, cur_book, cur_chapter, cur_verse_num, current_text_buffer)
+                    cur_verse_num = new_verse_num
+                    current_text_buffer = "" # Reset buffer
+                    line_to_process = rest_of_line # Only process the rest of the line
+                    new_verse_started_on_line = True
+                
+                # 4. Process the line (or rest_of_line) for *inline digit* markers
                 line_cursor = 0
-                found_verse_on_line = False
-                for match in verse_num_finder_re.finditer(line_stripped):
-                    if match.start() == 0 or line_stripped[match.start()-1].isspace():
-                        found_verse_on_line = True
-                        verse_num_str = match.group(1) # Group 1 is the number
+                matches = list(inline_verse_marker_re.finditer(line_to_process))
 
-                        text_slice = line_stripped[line_cursor:match.start()].strip()
-                        if current_verse_num > 0: current_line_text_buffer += " " + text_slice
-                        elif text_slice: print(f"  > WARNING: Discarding text before first verse '{verse_num_str}': '{text_slice[:50]}...' L{line_num+1}")
+                if not matches:
+                    # No inline markers, this is a continuation line (or first part)
+                    if cur_verse_num > 0:
+                        current_text_buffer += " " + line_to_process
+                    # else: this is commentary, like "The primeval history..."
+                    continue
+                
+                # We have inline digit markers, process them
+                for match in matches:
+                    # 1. Get text *before* this marker
+                    text_slice = line_to_process[line_cursor:match.start()]
+                    
+                    if cur_verse_num > 0:
+                        current_text_buffer += " " + text_slice.strip()
+                    
+                    # If this is the *first* verse marker on the line (e.g. '2' in 'i...2...3')
+                    # AND a verse was NOT already started (e.g. 'i'),
+                    # then we write the buffer.
+                    if not new_verse_started_on_line or line_cursor > 0:
+                         count += _write_nrsv_verse(out, source, cur_book, cur_chapter, cur_verse_num, current_text_buffer)
 
-                        if current_verse_num > 0 and current_line_text_buffer:
-                            cleaned_text = re.sub(r'\s+', ' ', current_line_text_buffer).strip()
-                            row = { "id": f"{source}-{cur_book}-{cur_chapter}-{current_verse_num}", "source": source, "ref": f"{cur_book} {cur_chapter}:{current_verse_num}", "book": cur_book, "chapter": cur_chapter, "verse": current_verse_num, "text": cleaned_text }
-                            write(out, row); count += 1
+                    # 4. Start the *new* verse
+                    verse_num_str = match.group(1)
+                    cur_verse_num = int(verse_num_str) # Safe, regex is digits only
+                    current_text_buffer = "" # Reset buffer for the new verse
+                    line_cursor = match.end() # Move cursor past the marker
 
-                        try:
-                            current_verse_num = int(verse_num_str)
-                            current_line_text_buffer = "" # Reset buffer
-                            line_cursor = match.end() # Move cursor past number+space
-                        except ValueError:
-                            print(f"  > WARNING: Invalid verse num '{verse_num_str}' L{line_num+1}. Appending rest.")
-                            current_line_text_buffer += " " + line_stripped[line_cursor:]
-                            line_cursor = len(line_stripped)
-                            current_verse_num = 0; break # Stop processing line
+                # 5. Add any remaining text *after* the last marker
+                remaining_text = line_to_process[line_cursor:].strip()
+                if cur_verse_num > 0:
+                    current_text_buffer += " " + remaining_text
 
-                remaining_text = line_stripped[line_cursor:].strip()
-                if remaining_text: current_line_text_buffer += " " + remaining_text
-                if not found_verse_on_line and current_verse_num > 0: # Pure continuation line
-                     current_line_text_buffer += " " + line_stripped
+    except Exception as e:
+        print(f"  > FATAL ERROR during file processing: {e} on line {line_num+1}")
 
-    except Exception as e: print(f"  > FATAL ERROR during file processing: {e}")
+    # Write the very last verse after the loop ends
+    count += _write_nrsv_verse(out, source, cur_book, cur_chapter, cur_verse_num, current_text_buffer)
 
-    if cur_book and cur_chapter > 0 and current_verse_num > 0 and current_line_text_buffer:
-        cleaned_text = re.sub(r'\s+', ' ', current_line_text_buffer).strip()
-        row = { "id": f"{source}-{cur_book}-{cur_chapter}-{current_verse_num}", "source": source, "ref": f"{cur_book} {cur_chapter}:{current_verse_num}", "book": cur_book, "chapter": cur_chapter, "verse": current_verse_num, "text": cleaned_text }
-        write(out, row); count += 1
+    if count == 0:
+        print(f"  > FATAL ERROR: Wrote 0 records.")
+    else:
+        print(f"  > Wrote {count} records.")
 
-    if count == 0: print(f"  > FATAL ERROR: Wrote 0 records.")
-    else: print(f"  > Wrote {count} records.")
+# (END OF REWRITTEN SECTION v4)
 
 
 # --- 3. Parser for corpus/tanakh_et.txt ---
-# (Confirmed working with warnings - Needs final check after fixes elsewhere)
+# (REWRITTEN v2 - Confirmed Working)
 def parse_tanakh(inp: str, source: str, out: TextIO):
-    print(f"Using dedicated parser: parse_tanakh (Reference Fix v2)...")
+    print(f"Using dedicated parser: parse_tanakh (REWRITTEN for multiline)...")
     cur_book = ""
-    cv_line_pattern = re.compile(r'^\s*(\d+),(\d+)\s*$')
+    cur_chap = 0
+    cur_verse = 0
+    current_text_buffer = ""
     in_scripture = False
     count = 0
-    pending_cv = None
-    last_line_was_cv = False
+    
+    cv_line_pattern = re.compile(r'^\s*(\d+),(\d+)\s*$')
+    
+    # Helper to write the buffer
+    def _write_verse(book, chap, verse, text):
+        if book and chap > 0 and verse > 0 and text:
+            cleaned_text = re.sub(r'\s+', ' ', text).strip()
+            cleaned_text = re.sub(r'\{[SPN]\}', '', cleaned_text).strip() # Clean tags here
+            if cleaned_text:
+                row = { "id": f"{source}-{book.replace(' ', '_')}-{chap}-{verse}", "source": source, "ref": f"{book} {chap}:{verse}", "book": book, "chapter": chap, "verse": verse, "text": cleaned_text }
+                write(out, row)
+                return 1
+        return 0
 
-    with open(inp, "r", encoding="utf-8", errors="ignore") as f:
-        # ... [rest of parse_tanakh - unchanged] ...
-        for line_num, line in enumerate(f):
-            line_stripped = line.strip()
-            if not line_stripped:
-                last_line_was_cv = False
-                continue
+    try:
+        with open(inp, "r", encoding="utf-8", errors="ignore") as f:
+            for line_num, line in enumerate(f):
+                line_stripped = line.strip()
+                if not line_stripped:
+                    continue
 
-            if not in_scripture:
-                if line_stripped.lower() == "genesis":
-                     in_scripture = True; cur_book = "Genesis"; last_line_was_cv = False
-                     continue
-                else: continue
+                if not in_scripture:
+                    if line_stripped.lower() == "genesis":
+                        in_scripture = True
+                        cur_book = "Genesis"
+                    continue
 
-            cv_match = cv_line_pattern.match(line_stripped)
-            if cv_match:
-                if pending_cv: print(f"  > WARNING: Found verse marker '{line_stripped}' at L{line_num+1} after previous {pending_cv}. Discarding previous.")
-                try: pending_cv = (int(cv_match.group(1)), int(cv_match.group(2)))
-                except ValueError: print(f"  > WARNING: Invalid C,V format '{line_stripped}' L{line_num+1}."); pending_cv = None
-                last_line_was_cv = True
-                continue
+                cv_match = cv_line_pattern.match(line_stripped)
+                potential_book_header_raw = line_stripped.title()
+                potential_book_header = re.sub(r'^(\d)\s', r'\1 ', potential_book_header_raw)
+                is_book_header = potential_book_header.lower() in TANAKH_BOOKS_LOWER
 
-            if pending_cv:
-                potential_book_header = line_stripped.title(); potential_book_header = re.sub(r'^(\d)\s', r'\1 ', potential_book_header)
-                if not last_line_was_cv and potential_book_header.lower() in TANAKH_BOOKS_LOWER:
-                     print(f"  > WARNING: Found header '{potential_book_header}' L{line_num+1} expecting text for {cur_book} {pending_cv[0]}:{pending_cv[1]}. Discarding verse.")
-                     cur_book = potential_book_header; pending_cv = None; last_line_was_cv = False
-                     continue
+                if cv_match:
+                    # Found a new verse marker. Write the previous one.
+                    count += _write_verse(cur_book, cur_chap, cur_verse, current_text_buffer)
+                    
+                    # Start the new verse
+                    try:
+                        cur_chap = int(cv_match.group(1))
+                        cur_verse = int(cv_match.group(2))
+                        current_text_buffer = "" # Reset buffer
+                    except ValueError:
+                        print(f"  > WARNING: Invalid C,V format '{line_stripped}' L{line_num+1}.")
+                        cur_chap, cur_verse = 0, 0 # Invalidate
+                    continue
 
-                text = re.sub(r'\{[SPN]\}', '', line_stripped).strip()
-                cleaned_text = re.sub(r'\s+', ' ', text).strip()
-                if cleaned_text:
-                    chap, verse = pending_cv
-                    row = { "id": f"{source}-{cur_book}-{chap}-{verse}", "source": source, "ref": f"{cur_book} {chap}:{verse}", "book": cur_book, "chapter": chap, "verse": verse, "text": cleaned_text }
-                    write(out, row); count += 1
-                else: print(f"  > WARNING: Empty text line after C,V {pending_cv} L{line_num+1}.")
-                pending_cv = None; last_line_was_cv = False
-                continue
+                if is_book_header:
+                    # Found a new book header. Write the previous verse.
+                    count += _write_verse(cur_book, cur_chap, cur_verse, current_text_buffer)
+                    
+                    # Start the new book
+                    cur_book = potential_book_header
+                    cur_chap, cur_verse = 0, 0
+                    current_text_buffer = ""
+                    continue
 
-            potential_book_header = line_stripped.title(); potential_book_header = re.sub(r'^(\d)\s', r'\1 ', potential_book_header)
-            if not last_line_was_cv and potential_book_header.lower() in TANAKH_BOOKS_LOWER:
-                 cur_book = potential_book_header
-                 last_line_was_cv = False
-                 continue
+                # If it's not a marker, and we are in a valid verse, append text.
+                if cur_book and cur_chap > 0 and cur_verse > 0:
+                    # This is a continuation line of verse text
+                    cleaned_line = re.sub(r'\{[SPN]\}', '', line_stripped).strip()
+                    if cleaned_line:
+                        current_text_buffer += " " + cleaned_line
+                # else:
+                    # This skips lines between books/before first verse, which is good.
 
-            last_line_was_cv = False
+    except Exception as e:
+        print(f"  > FATAL ERROR during file processing: {e} on line {line_num+1}")
 
-    if pending_cv: print(f"  > WARNING: End of file while waiting for text for {cur_book} {pending_cv[0]}:{pending_cv[1]}.")
-    if count == 0 and in_scripture: print(f"  > FATAL ERROR: Wrote 0 records despite trigger.")
-    elif not in_scripture: print(f"  > FATAL ERROR: Wrote 0 records. Trigger 'genesis' not found.")
-    else: print(f"  > Wrote {count} records.")
+    # Write the very last verse
+    count += _write_verse(cur_book, cur_chap, cur_verse, current_text_buffer)
+
+    if count == 0:
+        print(f"  > FATAL ERROR: Wrote 0 records.")
+    else:
+        print(f"  > Wrote {count} records.")
+
+# (END OF REWRITTEN SECTION v2)
 
 
 # --- 4. Parser for corpus/en.yusufali.txt ---
-# (Confirmed working with warnings - Needs final check after fixes elsewhere)
+# (Confirmed working - No changes needed)
 def parse_quran(inp: str, source: str, out: TextIO):
     print(f"Using dedicated parser: parse_quran (Gutenberg - Ref Fix v2)...")
     verse_num_re = re.compile(r'^(\d{3})\.(\d{3})$')
@@ -300,7 +393,6 @@ def parse_quran(inp: str, source: str, out: TextIO):
     last_processed_marker = (0,0)
 
     with open(inp, "r", encoding="utf-8", errors="ignore") as f:
-        # ... [rest of parse_quran - unchanged] ...
         for line_num, line in enumerate(f): # Added line number
             line_stripped = line.strip()
 
@@ -311,11 +403,11 @@ def parse_quran(inp: str, source: str, out: TextIO):
             verse_match = verse_num_re.match(line_stripped)
             if verse_match:
                 if current_sura > 0 and current_verse > 0 and yusuf_ali_text_buffer and (current_sura, current_verse) != last_processed_marker:
-                     cleaned_text = re.sub(r'\s+', ' ', yusuf_ali_text_buffer).strip()
-                     row = { "id": f"{source}-{current_sura}-{current_verse}", "source": source, "ref": f"Qur'an {current_sura}:{current_verse}", "book": "Qur'an", "chapter": current_sura, "verse": current_verse, "text": cleaned_text }
-                     write(out, row); count += 1
-                     last_processed_marker = (current_sura, current_verse)
-                     yusuf_ali_text_buffer = ""
+                    cleaned_text = re.sub(r'\s+', ' ', yusuf_ali_text_buffer).strip()
+                    row = { "id": f"{source}-{current_sura}-{current_verse}", "source": source, "ref": f"Qur'an {current_sura}:{current_verse}", "book": "Qur'an", "chapter": current_sura, "verse": current_verse, "text": cleaned_text }
+                    write(out, row); count += 1
+                    last_processed_marker = (current_sura, current_verse)
+                    yusuf_ali_text_buffer = ""
 
                 try:
                     new_sura = int(verse_match.group(1)); new_verse = int(verse_match.group(2))
@@ -330,7 +422,7 @@ def parse_quran(inp: str, source: str, out: TextIO):
                     if yusuf_ali_text_buffer: print(f"  > WARNING: Overwriting buffer for {current_sura}:{current_verse} at L{line_num+1}")
                     yusuf_ali_text_buffer = yusuf_match.group(1).strip()
                 elif yusuf_ali_text_buffer and not line_stripped.startswith(('P:', 'S:')) and not verse_num_re.match(line_stripped) and "---" not in line and "Chapter" not in line and "Revealed At:" not in line:
-                     yusuf_ali_text_buffer += " " + line_stripped
+                    yusuf_ali_text_buffer += " " + line_stripped
 
     if current_sura > 0 and current_verse > 0 and yusuf_ali_text_buffer and (current_sura, current_verse) != last_processed_marker:
         cleaned_text = re.sub(r'\s+', ' ', yusuf_ali_text_buffer).strip()
@@ -343,7 +435,6 @@ def parse_quran(inp: str, source: str, out: TextIO):
 # (Confirmed working - No changes needed)
 def parse_gita(inp: str, source: str, out: TextIO):
     print(f"Using dedicated parser: parse_gita...")
-    # ... [rest of parse_gita - unchanged] ...
     text_num_re = re.compile(r'^\s*TEXT(?:S)?\s+([\d\-]+)\s*$')
     translation_re = re.compile(r'^\s*TRANSLATION\s*$')
     purport_re = re.compile(r'^\s*PURPORT\s*$')
@@ -405,6 +496,7 @@ def parse_gita(inp: str, source: str, out: TextIO):
     print(f"  > Wrote {count} records.")
 
 # --- 6. Parser for corpus/damapada.txt (ASCII ID Fix) ---
+# (Confirmed working - No changes needed)
 def parse_dhammapada(inp: str, source: str, out: TextIO):
     print(f"Using dedicated parser: parse_dhammapada (ASCII ID Fix)...")
     chapter_re = re.compile(r'^\s*(I|V|X|L|C|D|M)+\s*\:\s*([\w\s()]+)\s*$') # Allow more roman numerals & ()
@@ -422,14 +514,14 @@ def parse_dhammapada(inp: str, source: str, out: TextIO):
             # State trigger: Look for first chapter marker more reliably
             # Example: "I : Pairs" or "II : Heedfulness"
             if not in_scripture:
-                 match_chap = chapter_re.match(line_stripped)
-                 if match_chap:
-                     in_scripture = True
-                     cur_chapter_name = match_chap.group(2).strip()
-                     # print(f"DEBUG: Triggered scripture start L{line_num+1}, Chapter: {cur_chapter_name}")
-                     continue # Skip the trigger line itself
-                 else:
-                     continue # Keep skipping intro
+                match_chap = chapter_re.match(line_stripped)
+                if match_chap:
+                    in_scripture = True
+                    cur_chapter_name = match_chap.group(2).strip()
+                    # print(f"DEBUG: Triggered scripture start L{line_num+1}, Chapter: {cur_chapter_name}")
+                    continue # Skip the trigger line itself
+                else:
+                    continue # Keep skipping intro
 
             if not line_stripped: continue # Skip blank lines within scripture
 
