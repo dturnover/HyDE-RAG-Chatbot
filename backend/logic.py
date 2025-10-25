@@ -1,6 +1,6 @@
 # logic.py
-# Removed "competitor" assumption. Refined prompts for Step 1 tone and Step 7 referral.
-# Assumes Christian ('bible_nrsv') default faith.
+# FIX: Corrected UnboundLocalError in _edit_distance function.
+# Contains all other recent changes (tone, default faith, referral logic).
 import re
 from typing import Dict, List, Optional, Iterable
 from dataclasses import dataclass, field
@@ -25,10 +25,18 @@ class SessionState:
         user_turns = sum(1 for turn in self.history if turn.get("role") == "user")
         return user_turns # Count user messages
 
-# --- Keyword/Typo Functions (Unchanged) ---
+# --- Keyword/Typo Functions (BUG FIXED) ---
 def _edit_distance(s1: str, s2: str) -> int:
     """Calculates the Levenshtein edit distance between two strings."""
-    if len(s1) > len(s2): s1, s2 = s2, s1; distances = range(len(s1) + 1)
+    # ★★★ BUG FIX HERE ★★★
+    # Original: if len(s1) > len(s2): s1, s2 = s2, s1; distances = range(len(s1) + 1)
+    # This only initialized 'distances' if the 'if' was true.
+    
+    if len(s1) > len(s2): s1, s2 = s2, s1
+    # FIX: Initialize 'distances' *after* the if statement, so it always runs.
+    distances = range(len(s1) + 1)
+    # ★★★ END BUG FIX ★★★
+
     for i2, c2 in enumerate(s2):
         new_distances = [i2 + 1]
         for i1, c1 in enumerate(s1):
@@ -46,8 +54,11 @@ def _check_for_keywords_with_typo_tolerance(msg: str, keywords: Iterable[str]) -
     for keyword in keywords:
         max_diff = 1 if len(keyword) <= 6 else 2; len_tolerance = 2
         for token in msg_tokens:
-            if abs(len(token) - len(keyword)) <= len_tolerance and _edit_distance(token, keyword) <= max_diff:
-                return keyword
+            # Check for typos on words of similar length for efficiency
+            if abs(len(token) - len(keyword)) <= len_tolerance:
+                # Only call _edit_distance if length is plausible
+                if _edit_distance(token, keyword) <= max_diff:
+                    return keyword
     return None
 
 # --- Updated System Prompt reflecting Step 1 Tone (No Competitor Assumption) ---
