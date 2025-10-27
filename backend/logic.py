@@ -1,6 +1,6 @@
 # logic.py
-# Refined initial guidance logic to be concise for greetings,
-# but expansive when RAG is triggered.
+# Re-enabled LLM query rewrite with a "Silver Lining" prompt
+# to find appropriate, hopeful verses.
 import re
 from typing import Dict, List, Optional, Iterable
 from dataclasses import dataclass, field
@@ -61,14 +61,13 @@ def system_message(s: SessionState, quote_allowed: bool, retrieval_ctx: Optional
     rag_instruction = ""
     initial_response_guidance = "" # Keep responses concise initially
 
-    # ★★★ REFINED TONE LOGIC ★★★
+    # Refined Instruction based on conversation length (Step 1 adjustment)
     if s.turn_count <= 1 and not retrieval_ctx:
         # It's an early, simple message (like "hi" or "im catholic")
         initial_response_guidance = "Keep your initial responses very concise (1-2 sentences), focusing on listening and empathy."
     elif retrieval_ctx:
         # A trigger word was hit. Be more talkative as requested.
         initial_response_guidance = "The user has shared a concern and a relevant scripture was found. Respond with empathy and elaborate gently on how the retrieved verse might apply to their feeling."
-    # ★★★ END REFINED TONE LOGIC ★★★
     
     # Determine RAG instruction (Step 3)
     if quote_allowed and retrieval_ctx:
@@ -110,27 +109,69 @@ def try_set_faith(msg: str, s: SessionState) -> bool:
 
 # --- Retrieval Trigger (Unchanged) ---
 def wants_retrieval(msg: str) -> bool:
+    """Checks if the message likely requests or implies a need for scripture."""
     all_trigger_keywords = config.ASK_WORDS | config.DISTRESS_KEYWORDS
     match = _check_for_keywords_with_typo_tolerance(msg, all_trigger_keywords)
     logging.info(f"[DEBUG logic.py] wants_retrieval check on '{msg[:50]}...': Match = {match}")
     return match is not None
 
-# --- Query Passthrough (Unchanged) ---
+# ★★★ RE-ENABLED LLM REWRITE WITH "SILVER LINING" PROMPT ★★★
 def _get_rewritten_query(user_message: str) -> str:
-    logging.info(f"[DEBUG logic.py] Using original query for search: '{user_message}'")
-    cleaned_message = user_message.strip().strip('"').strip("'")
-    return cleaned_message
+    """Uses a fast LLM call to rewrite the user's query for better RAG results."""
+    if not client:
+         logging.info("[DEBUG logic.py] OpenAI client not available, returning original query.")
+         return user_message
+    
+    logging.info(f"[DEBUG logic.py] Rewriting query: '{user_message}'")
+    
+    # New, more specific prompt to find helpful, contrasting verses
+    system_prompt = (
+        "You are a search query transformation expert for a spiritual RAG chatbot. "
+        "Your task is to convert a user's expression of distress into a query that finds a *solution-oriented* or *hopeful* passage. "
+        "**Crucially, DO NOT** create a query that *mirrors* the negative emotion (e.g., 'verses about sadness'). Search for the *antidote*. "
+        "**AVOID** themes of divine wrath or judgment. "
+        "Examples:\n"
+        "User: 'im depressed. i lost my fight yesterday'\n"
+        "Rewrite: 'Scripture about finding hope after failure' or 'verses about healing and strength in sorrow'\n"
+        "User: 'im nervous about my upcoming fight'\n"
+        "Rewrite: 'verses about courage and finding strength in God' or 'scripture for peace and overcoming anxiety before a challenge'\n"
+        "User: 'i'm so angry at my coach'\n"
+        "Rewrite: 'scripture about patience and forgiveness' or 'verses on managing anger and finding peace'"
+    )
+    
+    try:
+        completion = client.chat.completions.create(
+            model="gpt-4o-mini", # Use a fast model
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message}
+            ],
+            temperature=0.0,
+            max_tokens=60, # Allow for slightly longer rewrite
+            stream=False
+        )
+        rewritten = completion.choices[0].message.content
+        rewritten_clean = rewritten.strip().strip('"').strip("'")
+        logging.info(f"[DEBUG logic.py] Rewritten query: '{rewritten_clean}'")
+        return rewritten_clean if rewritten_clean else user_message
+    except Exception as e:
+         logging.error(f"[DEBUG logic.py] ERROR during query rewrite: {e}")
+         return user_message # Fallback to original query on error
+# ★★★ END MODIFIED FUNCTION ★★★
 
 # --- RAG Context Retrieval (Updated Faith Handling) ---
 def get_rag_context(msg: str, s: SessionState) -> Optional[str]:
-    # Faith should be set (either explicitly or to default) by the time this runs
+    """
+    Determines if RAG is needed, gets the query, calls Pinecone search,
+    and formats the result for the system prompt context. Uses default faith if needed.
+    """
     if not s.faith:
         logging.error("[DEBUG logic.py] RAG check: Faith is None, THIS SHOULD NOT HAPPEN.")
         s.faith = "bible_nrsv" # Failsafe
 
     if wants_retrieval(msg): # Check retrieval trigger first
         logging.info(f"[DEBUG logic.py] Retrieval triggered. Using faith: {s.faith}")
-        search_query = _get_rewritten_query(msg)
+        search_query = _get_rewritten_query(msg) # Call the rewrite function
         verse_text, verse_ref = rag.find_relevant_scripture(search_query, s.faith) # Use the set faith
 
         if verse_text and verse_ref:
@@ -145,7 +186,10 @@ def get_rag_context(msg: str, s: SessionState) -> Optional[str]:
 
 # --- Escalation & Metrics (Unchanged Placeholder) ---
 def update_session_state(msg: str, s: SessionState) -> None:
-    """Updates session state, including checking for escalation triggers."""
+    """
+    Updates session state, including checking for escalation triggers.
+    NOTE: This is called in main.py *after* try_set_faith.
+    """
     logging.info(f"[DEBUG logic.py] Updating session state. Current turn: {s.turn_count}")
     if _check_for_keywords_with_typo_tolerance(msg, CRISIS_KEYWORDS):
         s.escalate_status = "crisis"
@@ -172,7 +216,6 @@ def apply_referral_footer(text: str, s: SessionState) -> str:
     # Step 7: Standard Faith Leader Offer - ONLY if not a crisis AND turn threshold reached
     elif s.escalate_status == "needs_review":
         standard_offer = "Would you like help connecting with a faith leader from your tradition?"
-        # Check if similar offer already exists near the end of the text
         last_part = text[-len(standard_offer)*2:] # Check last ~100 chars
         if "faith leader" not in last_part.lower() and "spiritual leader" not in last_part.lower():
              footer += f"\n\n{standard_offer}"
