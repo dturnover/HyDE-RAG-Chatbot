@@ -1,16 +1,18 @@
 # rag.py
-# Added another print right before candidate logging block.
+# Handles Retrieval-Augmented Generation using Pinecone.
+# Includes debug logging to show top 5 candidates from Pinecone.
 import os
 import re
 from openai import OpenAI
 from pinecone import Pinecone
 import logging
 
+# Configure logging (ensure level is INFO or DEBUG)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # --- Initialize OpenAI and Pinecone Clients ---
-# ... (Initialization code unchanged) ...
 try:
+    # Use the variable name 'client' as expected by logic.py
     client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
     pinecone_api_key = os.environ.get("PINECONE_API_KEY")
     pinecone_index_name = os.environ.get("PINECONE_INDEX_NAME")
@@ -26,16 +28,19 @@ try:
 
     index = pc.Index(pinecone_index_name)
     logging.info(f"Successfully connected to Pinecone index '{pinecone_index_name}'.")
+    try:
+        logging.info(f"Index stats: {index.describe_index_stats()}")
+    except Exception as stats_e:
+        logging.warning(f"Could not retrieve initial index stats: {stats_e}")
 
 except Exception as e:
     logging.error(f"FATAL ERROR during API client initialization: {e}")
     client = None; index = None
     raise RuntimeError(f"Failed to initialize API clients: {e}") from e
 
-
 # --- Core RAG Functions ---
-# ... (get_embedding, pinecone_search - unchanged) ...
 def get_embedding(text, model="text-embedding-3-small"):
+    """Generates an embedding for the given text using OpenAI."""
     if not client: logging.error("OpenAI client not initialized."); return None
     try:
         text = text.replace("\n", " ")
@@ -45,6 +50,7 @@ def get_embedding(text, model="text-embedding-3-small"):
     except Exception as e: logging.error(f"Error getting embedding: {e}"); return None
 
 def pinecone_search(query_embedding, faith_filter, top_k=5):
+    """Searches the Pinecone index for the most relevant scriptures."""
     if not index: logging.error("Pinecone index not initialized."); return []
     if not query_embedding: logging.error("Invalid query embedding."); return []
     if not faith_filter: logging.error("Faith filter cannot be empty."); return []
@@ -64,8 +70,8 @@ def pinecone_search(query_embedding, faith_filter, top_k=5):
     except Exception as e: logging.error(f"Error querying Pinecone: {e}"); return []
 
 # --- Helper Function ---
-# ... (clean_verse - unchanged) ...
 def clean_verse(text):
+    """Removes extraneous characters and formatting from verse text."""
     if not text: return ""
     text = re.sub(r'\[\d+\]', '', text); text = text.replace("...", "").replace("..", ".")
     text = re.sub(r'\s+', ' ', text).strip(); return text
@@ -73,7 +79,8 @@ def clean_verse(text):
 # --- Main Orchestration Function ---
 def find_relevant_scripture(transformed_query: str, faith_context: str) -> tuple[str | None, str | None]:
     """Finds the single most relevant scripture using Pinecone."""
-    print("--- ENTERING find_relevant_scripture ---") # Entry Print
+    # ★★★ Entry Print ★★★
+    print("--- ENTERING find_relevant_scripture ---") 
     logging.info(f"Starting Pinecone search: faith='{faith_context}', query='{transformed_query}'")
     if not transformed_query: logging.warning("Query empty."); return None, None
     if not faith_context: logging.warning("Faith context empty."); return None, None
