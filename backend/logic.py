@@ -1,6 +1,6 @@
 # logic.py
 # Re-enabled LLM query rewrite with a "Silver Lining" prompt
-# to find appropriate, hopeful verses.
+# ★★★ FIXED RAG RULE to handle long/complex reference strings ★★★
 import re
 from typing import Dict, List, Optional, Iterable
 from dataclasses import dataclass, field
@@ -63,26 +63,26 @@ def system_message(s: SessionState, quote_allowed: bool, retrieval_ctx: Optional
 
     # Refined Instruction based on conversation length (Step 1 adjustment)
     if s.turn_count <= 1 and not retrieval_ctx:
-        # It's an early, simple message (like "hi" or "im catholic")
         initial_response_guidance = "Keep your initial responses very concise (1-2 sentences), focusing on listening and empathy."
     elif retrieval_ctx:
-        # A trigger word was hit. Be more talkative as requested.
         initial_response_guidance = "The user has shared a concern and a relevant scripture was found. Respond with empathy and elaborate gently on how the retrieved verse might apply to their feeling."
     
     # Determine RAG instruction (Step 3)
     if quote_allowed and retrieval_ctx:
-        rag_instruction = ("A relevant scripture is provided below. Weave a short, direct quote from the 'text' into your empathetic response, enclosed in quotes. Cite it afterward (e.g., — Isaiah 41:10).")
+        # ★★★ THIS IS THE FIX ★★★
+        # Removed the specific example (e.g., — Isaiah 41:10)
+        # Now tells the LLM to *exactly* copy the 'Reference' field, whatever it is.
+        rag_instruction = ("A relevant scripture is provided below. Weave a short, direct quote from the 'text' into your empathetic response, enclosed in quotes. "
+                           "After the quote, you MUST cite the full 'Reference' field provided in the context, prefixed with an em dash (e.g., — [The Retrieved Reference]).")
     elif s.faith: # Faith is known (or assumed)
         rag_instruction = (f"Their faith ({s.faith}) is known, but no scripture was retrieved. Respond with empathy and practical support, without mentioning scripture.")
     else:
-        # This block should now be rarely hit due to default assumption, but good fallback.
         rag_instruction = ("Their faith is UNKNOWN. Do not provide scripture. Gently ask them to share their faith tradition if they are seeking scriptural support.")
 
 
     escalation_note = f"Escalation Status: {s.escalate_status}."
     session_status = f"Faith set={s.faith or 'bible_nrsv (Assumed)'}. User Turn={s.turn_count}. Quote allowed={quote_allowed and bool(retrieval_ctx)}. {escalation_note}"
 
-    # REMOVED REFERRAL RULE FROM HERE
     full_prompt = (f"{SYSTEM_BASE_FLOW} {initial_response_guidance}\n--- CONTEXT ---\n"
                    f"CURRENT SESSION STATUS: {session_status}\n"
                    f"RAG RULE: {rag_instruction}\n"
@@ -95,7 +95,7 @@ def try_set_faith(msg: str, s: SessionState) -> bool:
     matched_keyword = _check_for_keywords_with_typo_tolerance(msg, config.FAITH_KEYWORDS.keys())
     if matched_keyword:
         new_faith = config.FAITH_KEYWORDS[matched_keyword]
-        if s.faith != new_faith: # Check if it's actually changing
+        if s.faith != new_faith:
             s.faith = new_faith
             logging.info(f"[DEBUG logic.py] Faith explicitly set to: {s.faith} based on keyword '{matched_keyword}'")
             return True
@@ -103,7 +103,7 @@ def try_set_faith(msg: str, s: SessionState) -> bool:
     if s.faith is None:
         s.faith = "bible_nrsv" # Apply default Christian faith
         logging.info(f"[DEBUG logic.py] No faith specified, defaulting to: {s.faith}")
-        return False # Not explicitly set *this turn*
+        return False
         
     return False
 
@@ -141,13 +141,13 @@ def _get_rewritten_query(user_message: str) -> str:
     
     try:
         completion = client.chat.completions.create(
-            model="gpt-4o-mini", # Use a fast model
+            model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_message}
             ],
             temperature=0.0,
-            max_tokens=60, # Allow for slightly longer rewrite
+            max_tokens=60,
             stream=False
         )
         rewritten = completion.choices[0].message.content
@@ -156,7 +156,7 @@ def _get_rewritten_query(user_message: str) -> str:
         return rewritten_clean if rewritten_clean else user_message
     except Exception as e:
          logging.error(f"[DEBUG logic.py] ERROR during query rewrite: {e}")
-         return user_message # Fallback to original query on error
+         return user_message
 # ★★★ END MODIFIED FUNCTION ★★★
 
 # --- RAG Context Retrieval (Updated Faith Handling) ---
@@ -169,10 +169,10 @@ def get_rag_context(msg: str, s: SessionState) -> Optional[str]:
         logging.error("[DEBUG logic.py] RAG check: Faith is None, THIS SHOULD NOT HAPPEN.")
         s.faith = "bible_nrsv" # Failsafe
 
-    if wants_retrieval(msg): # Check retrieval trigger first
+    if wants_retrieval(msg):
         logging.info(f"[DEBUG logic.py] Retrieval triggered. Using faith: {s.faith}")
-        search_query = _get_rewritten_query(msg) # Call the rewrite function
-        verse_text, verse_ref = rag.find_relevant_scripture(search_query, s.faith) # Use the set faith
+        search_query = _get_rewritten_query(msg)
+        verse_text, verse_ref = rag.find_relevant_scripture(search_query, s.faith)
 
         if verse_text and verse_ref:
             logging.info(f"[DEBUG logic.py] RAG context generated: Ref='{verse_ref}', Text='{verse_text[:50]}...'")
@@ -204,24 +204,22 @@ def apply_referral_footer(text: str, s: SessionState) -> str:
     """Appends appropriate referral based on escalation status AND standard offer."""
     footer = ""
     crisis_referral_added = False
-    text = text.strip() # Ensure no trailing whitespace on LLM response
+    text = text.strip()
 
-    # Step 6: Specific referrals based on escalation
     if s.escalate_status == "crisis":
         footer += ("\n\nIt sounds like you're going through a very difficult time. For immediate support, "
                    "you can connect with people who can help by texting HOME to 741741 to reach the Crisis Text Line.")
         logging.info("[DEBUG logic.py] Appending crisis referral footer.")
         crisis_referral_added = True
     
-    # Step 7: Standard Faith Leader Offer - ONLY if not a crisis AND turn threshold reached
     elif s.escalate_status == "needs_review":
         standard_offer = "Would you like help connecting with a faith leader from your tradition?"
-        last_part = text[-len(standard_offer)*2:] # Check last ~100 chars
+        last_part = text[-len(standard_offer)*2:]
         if "faith leader" not in last_part.lower() and "spiritual leader" not in last_part.lower():
              footer += f"\n\n{standard_offer}"
              logging.info("[DEBUG logic.py] Appending standard faith leader referral (turn limit reached).")
         else:
              logging.info("[DEBUG logic.py] Skipping standard footer (turn limit), similar text already present.")
 
-    return footer # Return ONLY the footer text (main.py will add it)
+    return footer
 
