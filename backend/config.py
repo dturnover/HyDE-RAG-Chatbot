@@ -2,7 +2,7 @@
 # Contains API keys, model configs, and expanded keyword lists for RAG.
 import os
 from pathlib import Path
-from dotenv import load_dotenv # Added load_dotenv for consistency
+from dotenv import load_dotenv # Added load_dotenv
 
 # Load environment variables from .env file (if you use one)
 load_dotenv()
@@ -16,15 +16,15 @@ EMBED_MODEL    = os.getenv("EMBED_MODEL", "text-embedding-3-small")
 # Check if the key is loaded
 if not OPENAI_API_KEY:
     print("WARNING: OPENAI_API_KEY environment variable not found.")
-    # You might want to raise an error here if running in production
-    # raise ValueError("OPENAI_API_KEY environment variable not set.")
 
 # --- Faith Mapping ---
-# (Expanded to include all faiths)
+# (Using your provided map, expanded with other faiths)
 FAITH_KEYWORDS = {
-    # Christian / Catholic
-    "christian": "bible_nrsv", # Default Christian to NRSV as Catholic is specified
+    # Catholic uses the NRSV translation
     "catholic": "bible_nrsv",
+    
+    # Other Christian denominations use the ASV translation
+    "christian": "bible_asv",
     "protestant": "bible_asv",
     "baptist": "bible_asv",
     "methodist": "bible_asv",

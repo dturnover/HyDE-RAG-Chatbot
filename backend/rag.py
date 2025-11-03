@@ -1,6 +1,6 @@
 # rag.py
 # Handles Retrieval-Augmented Generation using Pinecone.
-# Includes debug logging to show top 5 candidates from Pinecone.
+# ★★★ Includes debug logging to show top 5 candidates from Pinecone. ★★★
 import os
 import re
 from openai import OpenAI

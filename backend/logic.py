@@ -1,5 +1,9 @@
 # logic.py
-# ★★★ FIXED RAG RULE to remove brackets from the example citation ★★★
+# Definitive version:
+# 1. "Silver Lining" prompt for query rewrite.
+# 2. Fixed RAG RULE for correct citation (no brackets).
+# 3. Client vision (no "competitor" assumption, default faith, footer referral).
+# 4. _edit_distance bug fix.
 import re
 from typing import Dict, List, Optional, Iterable
 from dataclasses import dataclass, field
@@ -9,13 +13,13 @@ import logging # Added logging
 
 client = rag.client # Use the client initialized in rag.py
 
-# --- Constants for Escalation (Ideally move to config.py) ---
+# --- Constants for Escalation (from config.py) ---
 TURN_THRESHOLD_ESCALATE = 5 # Example: Escalate after 5 user messages
-CRISIS_KEYWORDS = {"suicide", "kill myself", "hopeless", "can't go on", "want to die"} # Example keywords
+CRISIS_KEYWORDS = config.CRISIS_KEYWORDS
 
 @dataclass
 class SessionState:
-# ... (rest of SessionState class - unchanged) ...
+    """A temporary object to hold state for a single request."""
     history: List[Dict[str, str]] = field(default_factory=list)
     faith: Optional[str] = None
     escalate_status: str = "none" # 'none', 'needs_review', 'crisis'
@@ -27,7 +31,7 @@ class SessionState:
 
 # --- Keyword/Typo Functions (BUG FIXED) ---
 def _edit_distance(s1: str, s2: str) -> int:
-# ... (rest of _edit_distance - unchanged) ...
+    """Calculates the Levenshtein edit distance between two strings."""
     if len(s1) > len(s2): s1, s2 = s2, s1
     distances = range(len(s1) + 1) # This line is now correct
     for i2, c2 in enumerate(s2):
@@ -39,7 +43,7 @@ def _edit_distance(s1: str, s2: str) -> int:
     return distances[-1]
 
 def _check_for_keywords_with_typo_tolerance(msg: str, keywords: Iterable[str]) -> Optional[str]:
-# ... (rest of _check_for_keywords_with_typo_tolerance - unchanged) ...
+    """Checks a message for a list of keywords with typo tolerance."""
     m = msg.lower()
     for keyword in keywords: # Exact match first
         if re.search(r'\b' + re.escape(keyword) + r'\b', m): return keyword
@@ -56,20 +60,22 @@ def _check_for_keywords_with_typo_tolerance(msg: str, keywords: Iterable[str]) -
 SYSTEM_BASE_FLOW = """You are the Fight Chaplain. Speak calmly and spiritually, like a trusted guide, using respectful, unisex language. Acknowledge the courage required for facing challenges. Your primary role is to listen empathetically and offer support grounded in faith when known. Start by acknowledging the user's current state and inviting them to share more."""
 
 def system_message(s: SessionState, quote_allowed: bool, retrieval_ctx: Optional[str]) -> Dict[str, str]:
-# ... (rest of function - unchanged from your file) ...
+    """Generates the system message based on session state and RAG results."""
     rag_instruction = ""
     initial_response_guidance = "" # Keep responses concise initially
 
+    # Refined Instruction based on conversation length (Step 1 adjustment)
     if s.turn_count <= 1 and not retrieval_ctx:
         initial_response_guidance = "Keep your initial responses very concise (1-2 sentences), focusing on listening and empathy."
     elif retrieval_ctx:
         initial_response_guidance = "The user has shared a concern and a relevant scripture was found. Respond with empathy and elaborate gently on how the retrieved verse might apply to their feeling."
     
+    # Determine RAG instruction (Step 3)
     if quote_allowed and retrieval_ctx:
-        # ★★★ THIS IS THE FIX ★★★
+        # ★★★ THIS IS THE CITATION FIX ★★★
         # Removed the brackets [] from the example.
         rag_instruction = ("A relevant scripture is provided below. Weave a short, direct quote from the 'text' into your empathetic response, enclosed in quotes. "
-                           "After the quote, you MUST cite the full 'Reference' field provided in the context, prefixed with an em dash (e.g., — The Retrieved Reference).")
+                           "After the quote, you MUST cite the full 'Reference' field exactly as it is provided in the context, prefixed with an em dash (e.g., — The Retrieved Reference).")
     elif s.faith: 
         rag_instruction = (f"Their faith ({s.faith}) is known, but no scripture was retrieved. Respond with empathy and practical support, without mentioning scripture.")
     else:
@@ -86,7 +92,7 @@ def system_message(s: SessionState, quote_allowed: bool, retrieval_ctx: Optional
 
 # --- Faith Setting (Modified for Default Assumption) ---
 def try_set_faith(msg: str, s: SessionState) -> bool:
-# ... (rest of function - unchanged from your file) ...
+    """Attempts to set faith based on keywords. Returns True if faith was newly set."""
     matched_keyword = _check_for_keywords_with_typo_tolerance(msg, config.FAITH_KEYWORDS.keys())
     if matched_keyword:
         new_faith = config.FAITH_KEYWORDS[matched_keyword]
@@ -104,15 +110,15 @@ def try_set_faith(msg: str, s: SessionState) -> bool:
 
 # --- Retrieval Trigger (Unchanged) ---
 def wants_retrieval(msg: str) -> bool:
-# ... (rest of function - unchanged from your file) ...
+    """Checks if the message likely requests or implies a need for scripture."""
     all_trigger_keywords = config.ASK_WORDS | config.DISTRESS_KEYWORDS
     match = _check_for_keywords_with_typo_tolerance(msg, all_trigger_keywords)
     logging.info(f"[DEBUG logic.py] wants_retrieval check on '{msg[:50]}...': Match = {match}")
     return match is not None
 
-# ★★★ RE-ENABLED LLM REWRITE WITH "SILVER LINING" PROMPT ★★★
+# ★★★ RE-ENABLED "SILVER LINING" LLM REWRITE ★★★
 def _get_rewritten_query(user_message: str) -> str:
-# ... (rest of function - unchanged from your file) ...
+    """Uses a fast LLM call to rewrite the user's query for better RAG results."""
     if not client:
          logging.info("[DEBUG logic.py] OpenAI client not available, returning original query.")
          return user_message
@@ -154,7 +160,10 @@ def _get_rewritten_query(user_message: str) -> str:
 
 # --- RAG Context Retrieval (Updated Faith Handling) ---
 def get_rag_context(msg: str, s: SessionState) -> Optional[str]:
-# ... (rest of function - unchanged from your file) ...
+    """
+    Determines if RAG is needed, gets the query, calls Pinecone search,
+    and formats the result for the system prompt context. Uses default faith if needed.
+    """
     if not s.faith:
         logging.error("[DEBUG logic.py] RAG check: Faith is None, THIS SHOULD NOT HAPPEN.")
         s.faith = "bible_nrsv" # Failsafe
@@ -174,9 +183,12 @@ def get_rag_context(msg: str, s: SessionState) -> Optional[str]:
         logging.info("[DEBUG logic.py] Retrieval not triggered.")
         return None
 
-# --- Escalation & Metrics (Unchanged Placeholder) ---
+# --- Escalation & Metrics ---
 def update_session_state(msg: str, s: SessionState) -> None:
-# ... (rest of function - unchanged from your file) ...
+    """
+    Updates session state, including checking for escalation triggers.
+    NOTE: This is called in main.py *after* try_set_faith.
+    """
     logging.info(f"[DEBUG logic.py] Updating session state. Current turn: {s.turn_count}")
     if _check_for_keywords_with_typo_tolerance(msg, CRISIS_KEYWORDS):
         s.escalate_status = "crisis"
@@ -186,9 +198,9 @@ def update_session_state(msg: str, s: SessionState) -> None:
         s.escalate_status = "needs_review"
         logging.info(f"[DEBUG logic.py] Turn threshold reached. Status: 'needs_review'.")
 
-# --- Referral Footer (Updated Logic - Step 6 & 7) ---
+# --- Referral Footer (Step 6 & 7) ---
 def apply_referral_footer(text: str, s: SessionState) -> str:
-# ... (rest of function - unchanged from your file) ...
+    """Appends appropriate referral based on escalation status AND standard offer."""
     footer = ""
     crisis_referral_added = False
     text = text.strip()
