@@ -1,6 +1,6 @@
 # rag.py
 # Handles Retrieval-Augmented Generation using Pinecone.
-# ★★★ CHANGED DEBUG PRINTS TO LOGGING.ERROR TO FORCE THEM TO APPEAR ★★★
+# ★★★ CHANGED ALL DEBUG LOGS TO PRINT() TO FORCE THEM TO APPEAR ★★★
 import os
 import re
 from openai import OpenAI
@@ -8,6 +8,7 @@ from pinecone import Pinecone
 import logging
 
 # Configure logging (ensure level is INFO or DEBUG)
+# This config is for the module-level logs (init, errors)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # --- Initialize OpenAI and Pinecone Clients ---
@@ -56,9 +57,10 @@ def pinecone_search(query_embedding, faith_filter, top_k=5):
     if not faith_filter: logging.error("Faith filter cannot be empty."); return []
     source_filter_value = faith_filter
     try:
-        logging.info(f"Querying Pinecone: filter={{'source': '{source_filter_value}'}}, top_k={top_k}")
+        # Using print() here too, just in case logging.info is suppressed
+        print(f"DEBUG: Querying Pinecone: filter={{'source': '{source_filter_value}'}}, top_k={top_k}")
         query_results = index.query(vector=query_embedding, filter={"source": source_filter_value}, top_k=top_k, include_metadata=True)
-        logging.info(f"Pinecone returned {len(query_results.get('matches', []))} matches.")
+        print(f"DEBUG: Pinecone returned {len(query_results.get('matches', []))} matches.")
         results_list = []
         if query_results and query_results.get('matches'):
             for match in query_results['matches']:
@@ -79,28 +81,28 @@ def clean_verse(text):
 # --- Main Orchestration Function ---
 def find_relevant_scripture(transformed_query: str, faith_context: str) -> tuple[str | None, str | None]:
     """Finds the single most relevant scripture using Pinecone."""
-    # ★★★ CHANGED TO LOGGING.ERROR ★★★
-    logging.error("--- ENTERING find_relevant_scripture ---") 
-    logging.info(f"Starting Pinecone search: faith='{faith_context}', query='{transformed_query}'")
-    if not transformed_query: logging.warning("Query empty."); return None, None
-    if not faith_context: logging.warning("Faith context empty."); return None, None
-    if not index or not client: logging.error("Clients not init."); return None, None
+    # ★★★ CHANGED TO PRINT() ★★★
+    print("--- ENTERING find_relevant_scripture ---") 
+    print(f"--- DEBUG: Search query: '{transformed_query}', Faith: '{faith_context}' ---")
+    
+    if not transformed_query: print("--- DEBUG: Query empty, returning None ---"); return None, None
+    if not faith_context: print("--- DEBUG: Faith context empty, returning None ---"); return None, None
+    if not index or not client: logging.error("Clients not init."); return None, None # Keep logging.error for fatal issues
 
     query_embedding = get_embedding(transformed_query)
     if not query_embedding: logging.error("Failed query embedding."); return None, None
 
     search_results = pinecone_search(query_embedding, faith_context, top_k=5)
 
-    # ★★★ CHANGED TO LOGGING.ERROR ★★★
-    logging.error(f"--- DEBUG: About to log candidates. Found {len(search_results)} results. ---")
-    # ★★★ DEBUGGING BLOCK ★★★
+    # ★★★ CHANGED TO PRINT() ★★★
+    print(f"--- DEBUG: About to log candidates. Found {len(search_results)} results. ---")
     if search_results:
-        logging.error("--- Top 5 Pinecone Candidates ---") # Using ERROR to force log
+        print("--- Top 5 Pinecone Candidates ---")
         for i, result in enumerate(search_results):
-            logging.error(f"{i+1}. Ref: {result.get('ref', 'N/A')}, Score: {result.get('score', 0.0):.4f}, Text: '{result.get('text', '')[:80]}...'")
-        logging.error("--- End Candidates ---") # Using ERROR to force log
+            print(f"{i+1}. Ref: {result.get('ref', 'N/A')}, Score: {result.get('score', 0.0):.4f}, Text: '{result.get('text', '')[:80]}...'")
+        print("--- End Candidates ---")
     else:
-        logging.error("Pinecone returned no candidates.") # Using ERROR to force log
+        print("--- DEBUG: Pinecone returned no candidates. ---")
     # ★★★ END DEBUGGING BLOCK ★★★
 
     if search_results:
@@ -109,13 +111,13 @@ def find_relevant_scripture(transformed_query: str, faith_context: str) -> tuple
             if best_text and best_ref:
                 cleaned_text = clean_verse(best_text)
                 if len(cleaned_text.split()) >= 5: # Quality check
-                    logging.info(f"Search complete. Selected valid match: {best_ref} (Score: {best_match.get('score', 0.0):.4f})")
+                    print(f"--- DEBUG: Selected valid match: {best_ref} ---")
                     return cleaned_text, best_ref
-                else: logging.info(f"Skipping short match: {best_ref}")
+                else: print(f"--- DEBUG: Skipping short match: {best_ref} ---")
             else: logging.warning("Match missing text/ref.")
-        logging.info("No suitable long-enough match found in top results.")
+        print("--- DEBUG: No suitable long-enough match found in top 5. ---")
         return None, None
     else:
-        logging.info("No scripture found from Pinecone search.")
+        print("--- DEBUG: No scripture found from Pinecone search. ---")
         return None, None
 
