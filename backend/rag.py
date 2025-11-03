@@ -1,6 +1,6 @@
 # rag.py
 # Handles Retrieval-Augmented Generation using Pinecone.
-# ★★★ Includes debug logging to show top 5 candidates from Pinecone. ★★★
+# ★★★ CHANGED DEBUG PRINTS TO LOGGING.ERROR TO FORCE THEM TO APPEAR ★★★
 import os
 import re
 from openai import OpenAI
@@ -79,8 +79,8 @@ def clean_verse(text):
 # --- Main Orchestration Function ---
 def find_relevant_scripture(transformed_query: str, faith_context: str) -> tuple[str | None, str | None]:
     """Finds the single most relevant scripture using Pinecone."""
-    # ★★★ Entry Print ★★★
-    print("--- ENTERING find_relevant_scripture ---") 
+    # ★★★ CHANGED TO LOGGING.ERROR ★★★
+    logging.error("--- ENTERING find_relevant_scripture ---") 
     logging.info(f"Starting Pinecone search: faith='{faith_context}', query='{transformed_query}'")
     if not transformed_query: logging.warning("Query empty."); return None, None
     if not faith_context: logging.warning("Faith context empty."); return None, None
@@ -91,16 +91,16 @@ def find_relevant_scripture(transformed_query: str, faith_context: str) -> tuple
 
     search_results = pinecone_search(query_embedding, faith_context, top_k=5)
 
-    # ★★★ AGGRESSIVE DEBUG PRINT ★★★
-    print(f"--- DEBUG: About to log candidates. Found {len(search_results)} results. ---")
+    # ★★★ CHANGED TO LOGGING.ERROR ★★★
+    logging.error(f"--- DEBUG: About to log candidates. Found {len(search_results)} results. ---")
     # ★★★ DEBUGGING BLOCK ★★★
     if search_results:
-        logging.info("--- Top 5 Pinecone Candidates ---")
+        logging.error("--- Top 5 Pinecone Candidates ---") # Using ERROR to force log
         for i, result in enumerate(search_results):
-            logging.info(f"{i+1}. Ref: {result.get('ref', 'N/A')}, Score: {result.get('score', 0.0):.4f}, Text: '{result.get('text', '')[:80]}...'")
-        logging.info("--- End Candidates ---")
+            logging.error(f"{i+1}. Ref: {result.get('ref', 'N/A')}, Score: {result.get('score', 0.0):.4f}, Text: '{result.get('text', '')[:80]}...'")
+        logging.error("--- End Candidates ---") # Using ERROR to force log
     else:
-        logging.info("Pinecone returned no candidates.")
+        logging.error("Pinecone returned no candidates.") # Using ERROR to force log
     # ★★★ END DEBUGGING BLOCK ★★★
 
     if search_results:
