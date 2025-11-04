@@ -1,6 +1,6 @@
 # rag.py
 # Handles Retrieval-Augmented Generation using Pinecone.
-# ★★★ CHANGED ALL DEBUG LOGS TO PRINT() TO FORCE THEM TO APPEAR ★★★
+# ★★★ CHANGED ALL DEBUG PRINTS TO print(..., flush=True) TO FORCE LOGS ★★★
 import os
 import re
 from openai import OpenAI
@@ -58,9 +58,9 @@ def pinecone_search(query_embedding, faith_filter, top_k=5):
     source_filter_value = faith_filter
     try:
         # Using print() here too, just in case logging.info is suppressed
-        print(f"DEBUG: Querying Pinecone: filter={{'source': '{source_filter_value}'}}, top_k={top_k}")
+        print(f"DEBUG: Querying Pinecone: filter={{'source': '{source_filter_value}'}}, top_k={top_k}", flush=True)
         query_results = index.query(vector=query_embedding, filter={"source": source_filter_value}, top_k=top_k, include_metadata=True)
-        print(f"DEBUG: Pinecone returned {len(query_results.get('matches', []))} matches.")
+        print(f"DEBUG: Pinecone returned {len(query_results.get('matches', []))} matches.", flush=True)
         results_list = []
         if query_results and query_results.get('matches'):
             for match in query_results['matches']:
@@ -81,12 +81,12 @@ def clean_verse(text):
 # --- Main Orchestration Function ---
 def find_relevant_scripture(transformed_query: str, faith_context: str) -> tuple[str | None, str | None]:
     """Finds the single most relevant scripture using Pinecone."""
-    # ★★★ CHANGED TO PRINT() ★★★
-    print("--- ENTERING find_relevant_scripture ---") 
-    print(f"--- DEBUG: Search query: '{transformed_query}', Faith: '{faith_context}' ---")
+    # ★★★ CHANGED TO PRINT(..., flush=True) ★★★
+    print("--- ENTERING find_relevant_scripture ---", flush=True) 
+    print(f"--- DEBUG: Search query: '{transformed_query}', Faith: '{faith_context}' ---", flush=True)
     
-    if not transformed_query: print("--- DEBUG: Query empty, returning None ---"); return None, None
-    if not faith_context: print("--- DEBUG: Faith context empty, returning None ---"); return None, None
+    if not transformed_query: print("--- DEBUG: Query empty, returning None ---", flush=True); return None, None
+    if not faith_context: print("--- DEBUG: Faith context empty, returning None ---", flush=True); return None, None
     if not index or not client: logging.error("Clients not init."); return None, None # Keep logging.error for fatal issues
 
     query_embedding = get_embedding(transformed_query)
@@ -94,15 +94,15 @@ def find_relevant_scripture(transformed_query: str, faith_context: str) -> tuple
 
     search_results = pinecone_search(query_embedding, faith_context, top_k=5)
 
-    # ★★★ CHANGED TO PRINT() ★★★
-    print(f"--- DEBUG: About to log candidates. Found {len(search_results)} results. ---")
+    # ★★★ CHANGED TO PRINT(..., flush=True) ★★★
+    print(f"--- DEBUG: About to log candidates. Found {len(search_results)} results. ---", flush=True)
     if search_results:
-        print("--- Top 5 Pinecone Candidates ---")
+        print("--- Top 5 Pinecone Candidates ---", flush=True)
         for i, result in enumerate(search_results):
-            print(f"{i+1}. Ref: {result.get('ref', 'N/A')}, Score: {result.get('score', 0.0):.4f}, Text: '{result.get('text', '')[:80]}...'")
-        print("--- End Candidates ---")
+            print(f"{i+1}. Ref: {result.get('ref', 'N/A')}, Score: {result.get('score', 0.0):.4f}, Text: '{result.get('text', '')[:80]}...'", flush=True)
+        print("--- End Candidates ---", flush=True)
     else:
-        print("--- DEBUG: Pinecone returned no candidates. ---")
+        print("--- DEBUG: Pinecone returned no candidates. ---", flush=True)
     # ★★★ END DEBUGGING BLOCK ★★★
 
     if search_results:
@@ -111,13 +111,13 @@ def find_relevant_scripture(transformed_query: str, faith_context: str) -> tuple
             if best_text and best_ref:
                 cleaned_text = clean_verse(best_text)
                 if len(cleaned_text.split()) >= 5: # Quality check
-                    print(f"--- DEBUG: Selected valid match: {best_ref} ---")
+                    print(f"--- DEBUG: Selected valid match: {best_ref} ---", flush=True)
                     return cleaned_text, best_ref
-                else: print(f"--- DEBUG: Skipping short match: {best_ref} ---")
+                else: print(f"--- DEBUG: Skipping short match: {best_ref} ---", flush=True)
             else: logging.warning("Match missing text/ref.")
-        print("--- DEBUG: No suitable long-enough match found in top 5. ---")
+        print("--- DEBUG: No suitable long-enough match found in top 5. ---", flush=True)
         return None, None
     else:
-        print("--- DEBUG: No scripture found from Pinecone search. ---")
+        print("--- DEBUG: No scripture found from Pinecone search. ---", flush=True)
         return None, None
 
