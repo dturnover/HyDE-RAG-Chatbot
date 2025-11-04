@@ -1,6 +1,5 @@
 # logic.py
-# 1. More aggressive "antidote" rewrite prompt (V3) to fix bad Gita quote.
-# 2. Fixed RAG RULE (removed example) to fix messy citation.
+# ★★★ Added a regex cleanup step in get_rag_context for Gita citations ★★★
 import re
 from typing import Dict, List, Optional, Iterable
 from dataclasses import dataclass, field
@@ -17,7 +16,7 @@ CRISIS_KEYWORDS = getattr(config, 'CRISIS_KEYWORDS', {"suicide", "kill myself", 
 
 @dataclass
 class SessionState:
-    """A temporary object to hold state for a single request."""
+# ... (rest of SessionState class - unchanged) ...
     history: List[Dict[str, str]] = field(default_factory=list)
     faith: Optional[str] = None
     escalate_status: str = "none" # 'none', 'needs_review', 'crisis'
@@ -29,7 +28,7 @@ class SessionState:
 
 # --- Keyword/Typo Functions (BUG FIXED) ---
 def _edit_distance(s1: str, s2: str) -> int:
-    """Calculates the Levenshtein edit distance between two strings."""
+# ... (rest of _edit_distance - unchanged) ...
     if len(s1) > len(s2): s1, s2 = s2, s1
     distances = range(len(s1) + 1) # This line is now correct
     for i2, c2 in enumerate(s2):
@@ -41,7 +40,7 @@ def _edit_distance(s1: str, s2: str) -> int:
     return distances[-1]
 
 def _check_for_keywords_with_typo_tolerance(msg: str, keywords: Iterable[str]) -> Optional[str]:
-    """Checks a message for a list of keywords with typo tolerance."""
+# ... (rest of _check_for_keywords_with_typo_tolerance - unchanged) ...
     m = msg.lower()
     for keyword in keywords: # Exact match first
         if re.search(r'\b' + re.escape(keyword) + r'\b', m): return keyword
@@ -58,21 +57,17 @@ def _check_for_keywords_with_typo_tolerance(msg: str, keywords: Iterable[str]) -
 SYSTEM_BASE_FLOW = """You are the Fight Chaplain. Speak calmly and spiritually, like a trusted guide, using respectful, unisex language. Acknowledge the courage required for facing challenges. Your primary role is to listen empathetically and offer support grounded in faith when known. Start by acknowledging the user's current state and inviting them to share more."""
 
 def system_message(s: SessionState, quote_allowed: bool, retrieval_ctx: Optional[str]) -> Dict[str, str]:
-    """Generates the system message based on session state and RAG results."""
+# ... (rest of system_message - unchanged from your file) ...
     rag_instruction = ""
     initial_response_guidance = "" # Keep responses concise initially
 
-    # Refined Instruction based on conversation length (Step 1 adjustment)
     if s.turn_count <= 1 and not retrieval_ctx:
         initial_response_guidance = "Keep your initial responses very concise (1-2 sentences), focusing on listening and empathy."
     elif retrieval_ctx:
         initial_response_guidance = "The user has shared a concern and a relevant scripture was found. Respond with empathy and elaborate gently on how the retrieved verse might apply to their feeling."
     
-    # Determine RAG instruction (Step 3)
     if quote_allowed and retrieval_ctx:
-        # ★★★ THIS IS THE CITATION FIX ★★★
-        # Removed the bad example (e.g., — The Retrieved Reference)
-        # Now tells the LLM to *exactly* copy the 'Reference' field.
+        # This RAG_RULE is now correct and flexible
         rag_instruction = ("A relevant scripture is provided below. Weave a short, direct quote from the 'text' into your empathetic response, enclosed in quotes. "
                            "After the quote, you MUST cite the full 'Reference' field exactly as it is provided in the context, prefixed with an em dash.")
     elif s.faith: 
@@ -91,7 +86,7 @@ def system_message(s: SessionState, quote_allowed: bool, retrieval_ctx: Optional
 
 # --- Faith Setting (Modified for Default Assumption) ---
 def try_set_faith(msg: str, s: SessionState) -> bool:
-    """Attempts to set faith based on keywords. Returns True if faith was newly set."""
+# ... (rest of function - unchanged from your file) ...
     matched_keyword = _check_for_keywords_with_typo_tolerance(msg, config.FAITH_KEYWORDS.keys())
     if matched_keyword:
         new_faith = config.FAITH_KEYWORDS[matched_keyword]
@@ -109,22 +104,21 @@ def try_set_faith(msg: str, s: SessionState) -> bool:
 
 # --- Retrieval Trigger (Unchanged) ---
 def wants_retrieval(msg: str) -> bool:
-    """Checks if the message likely requests or implies a need for scripture."""
+# ... (rest of function - unchanged from your file) ...
     all_trigger_keywords = config.ASK_WORDS | config.DISTRESS_KEYWORDS
     match = _check_for_keywords_with_typo_tolerance(msg, all_trigger_keywords)
     logging.info(f"[DEBUG logic.py] wants_retrieval check on '{msg[:50]}...': Match = {match}")
     return match is not None
 
-# ★★★ AGGRESSIVE "ANTIDOTE" REWRITE PROMPT V3 ★★★
+# ★★★ "ANTIDOTE" REWRITE PROMPT (This is working well) ★★★
 def _get_rewritten_query(user_message: str) -> str:
-    """Uses a fast LLM call to rewrite the user's query for better RAG results."""
+# ... (rest of function - unchanged from your file) ...
     if not client:
          logging.info("[DEBUG logic.py] OpenAI client not available, returning original query.")
          return user_message
     
     logging.info(f"[DEBUG logic.py] Rewriting query: '{user_message}'")
     
-    # New, more aggressive prompt to find a *solution*
     system_prompt = (
         "You are a search query transformation expert. Convert the user's expression of distress into a query for its *positive solution* or *hopeful antidote*. "
         "Your query MUST focus on positive concepts like 'hope', 'strength', 'courage', 'perseverance', 'healing', or 'finding peace'. "
@@ -172,10 +166,18 @@ def get_rag_context(msg: str, s: SessionState) -> Optional[str]:
     if wants_retrieval(msg):
         logging.info(f"[DEBUG logic.py] Retrieval triggered. Using faith: {s.faith}")
         search_query = _get_rewritten_query(msg)
-        # This calls the rag.py file (which we now know has working debug prints)
         verse_text, verse_ref = rag.find_relevant_scripture(search_query, s.faith)
 
         if verse_text and verse_ref:
+            # ★★★ GITA CITATION FIX ★★★
+            # Clean up the reference string ONLY if it's from the gita
+            if s.faith == "gita":
+                # Removes "Gita " from the start and ": Text " from the middle
+                cleaned_ref = re.sub(r':\s*Text\s*', ':', verse_ref).replace("Gita ", "", 1)
+                logging.info(f"[DEBUG logic.py] Cleaned Gita ref from '{verse_ref}' to '{cleaned_ref}'")
+                verse_ref = cleaned_ref # Use the cleaned version
+            # ★★★ END FIX ★★★
+
             logging.info(f"[DEBUG logic.py] RAG context generated: Ref='{verse_ref}', Text='{verse_text[:50]}...'")
             return f"RETRIEVED PASSAGE:\n- Reference: {verse_ref}\n- Text: \"{verse_text}\""
         else:
@@ -187,10 +189,7 @@ def get_rag_context(msg: str, s: SessionState) -> Optional[str]:
 
 # --- Escalation & Metrics ---
 def update_session_state(msg: str, s: SessionState) -> None:
-    """
-    Updates session state, including checking for escalation triggers.
-    NOTE: This is called in main.py *after* try_set_faith.
-    """
+# ... (rest of function - unchanged from your file) ...
     logging.info(f"[DEBUG logic.py] Updating session state. Current turn: {s.turn_count}")
     if _check_for_keywords_with_typo_tolerance(msg, CRISIS_KEYWORDS):
         s.escalate_status = "crisis"
@@ -202,7 +201,7 @@ def update_session_state(msg: str, s: SessionState) -> None:
 
 # --- Referral Footer (Step 6 & 7) ---
 def apply_referral_footer(text: str, s: SessionState) -> str:
-    """Appends appropriate referral based on escalation status AND standard offer."""
+# ... (rest of function - unchanged from your file) ...
     footer = ""
     crisis_referral_added = False
     text = text.strip()
