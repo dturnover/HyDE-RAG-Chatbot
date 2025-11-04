@@ -1,9 +1,6 @@
 # logic.py
-# Definitive version:
-# 1. "Silver Lining" prompt for query rewrite.
-# 2. Fixed RAG RULE for correct citation (no brackets).
-# 3. Client vision (no "competitor" assumption, default faith, footer referral).
-# 4. _edit_distance bug fix.
+# 1. More aggressive "antidote" rewrite prompt (V3) to fix bad Gita quote.
+# 2. Fixed RAG RULE (removed example) to fix messy citation.
 import re
 from typing import Dict, List, Optional, Iterable
 from dataclasses import dataclass, field
@@ -15,7 +12,8 @@ client = rag.client # Use the client initialized in rag.py
 
 # --- Constants for Escalation (from config.py) ---
 TURN_THRESHOLD_ESCALATE = 5 # Example: Escalate after 5 user messages
-CRISIS_KEYWORDS = config.CRISIS_KEYWORDS
+# Ensure CRISIS_KEYWORDS is loaded from config
+CRISIS_KEYWORDS = getattr(config, 'CRISIS_KEYWORDS', {"suicide", "kill myself", "hopeless", "can't go on", "want to die"})
 
 @dataclass
 class SessionState:
@@ -73,9 +71,10 @@ def system_message(s: SessionState, quote_allowed: bool, retrieval_ctx: Optional
     # Determine RAG instruction (Step 3)
     if quote_allowed and retrieval_ctx:
         # ★★★ THIS IS THE CITATION FIX ★★★
-        # Removed the brackets [] from the example.
+        # Removed the bad example (e.g., — The Retrieved Reference)
+        # Now tells the LLM to *exactly* copy the 'Reference' field.
         rag_instruction = ("A relevant scripture is provided below. Weave a short, direct quote from the 'text' into your empathetic response, enclosed in quotes. "
-                           "After the quote, you MUST cite the full 'Reference' field exactly as it is provided in the context, prefixed with an em dash (e.g., — The Retrieved Reference).")
+                           "After the quote, you MUST cite the full 'Reference' field exactly as it is provided in the context, prefixed with an em dash.")
     elif s.faith: 
         rag_instruction = (f"Their faith ({s.faith}) is known, but no scripture was retrieved. Respond with empathy and practical support, without mentioning scripture.")
     else:
@@ -116,7 +115,7 @@ def wants_retrieval(msg: str) -> bool:
     logging.info(f"[DEBUG logic.py] wants_retrieval check on '{msg[:50]}...': Match = {match}")
     return match is not None
 
-# ★★★ RE-ENABLED "SILVER LINING" LLM REWRITE ★★★
+# ★★★ AGGRESSIVE "ANTIDOTE" REWRITE PROMPT V3 ★★★
 def _get_rewritten_query(user_message: str) -> str:
     """Uses a fast LLM call to rewrite the user's query for better RAG results."""
     if not client:
@@ -125,18 +124,20 @@ def _get_rewritten_query(user_message: str) -> str:
     
     logging.info(f"[DEBUG logic.py] Rewriting query: '{user_message}'")
     
+    # New, more aggressive prompt to find a *solution*
     system_prompt = (
-        "You are a search query transformation expert for a spiritual RAG chatbot. "
-        "Your task is to convert a user's expression of distress into a query that finds a *solution-oriented* or *hopeful* passage. "
-        "**Crucially, DO NOT** create a query that *mirrors* the negative emotion (e.g., 'verses about sadness'). Search for the *antidote*. "
-        "**AVOID** themes of divine wrath or judgment. "
+        "You are a search query transformation expert. Convert the user's expression of distress into a query for its *positive solution* or *hopeful antidote*. "
+        "Your query MUST focus on positive concepts like 'hope', 'strength', 'courage', 'perseverance', 'healing', or 'finding peace'. "
+        "**ABSOLUTELY DO NOT** search for the negative emotion itself (e.g., 'sadness', 'morose', 'depressed', 'failure'). "
+        "**AVOID** all themes of divine wrath, judgment, or punishment. "
+        "Transform the user's pain into a search for its cure.\n"
         "Examples:\n"
         "User: 'im depressed. i lost my fight yesterday'\n"
-        "Rewrite: 'Scripture about finding hope after failure' or 'verses about healing and strength in sorrow'\n"
+        "Rewrite: 'Scripture about finding hope after failure' or 'verses about healing and strength in sorrow' or 'perseverance after a setback'\n"
         "User: 'im nervous about my upcoming fight'\n"
-        "Rewrite: 'verses about courage and finding strength in God' or 'scripture for peace and overcoming anxiety before a challenge'\n"
-        "User: 'i'm so angry at my coach'\n"
-        "Rewrite: 'scripture about patience and forgiveness' or 'verses on managing anger and finding peace'"
+        "Rewrite: 'verses about courage and finding strength in God' or 'scripture for peace and overcoming anxiety' or 'trusting in divine strength'\G"
+        "User: 'i feel so weak and tired'\n"
+        "Rewrite: 'finding strength in God when weary' or 'verses about spiritual renewal and endurance'"
     )
     
     try:
@@ -171,6 +172,7 @@ def get_rag_context(msg: str, s: SessionState) -> Optional[str]:
     if wants_retrieval(msg):
         logging.info(f"[DEBUG logic.py] Retrieval triggered. Using faith: {s.faith}")
         search_query = _get_rewritten_query(msg)
+        # This calls the rag.py file (which we now know has working debug prints)
         verse_text, verse_ref = rag.find_relevant_scripture(search_query, s.faith)
 
         if verse_text and verse_ref:
