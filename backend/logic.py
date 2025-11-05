@@ -1,8 +1,7 @@
 # logic.py
 #
 # This file holds all the "business logic" for the chatbot.
-# This version fixes the NameError by moving SessionState
-# to the top of the file before it is used.
+# This version fixes the "CRISPY" typo.
 
 import re
 from typing import Dict, List, Optional, Iterable
@@ -28,9 +27,7 @@ FAITH_DISPLAY_NAMES = {
     "dhammapada": "Buddhist (Dhammapada)",
 }
 
-# --- ★★★ BUG FIX ★★★ ---
-# The SessionState class is now defined HERE, *before*
-# any functions that use it as a type hint.
+# --- Session State ---
 @dataclass
 class SessionState:
     history: List[Dict[str, str]] = field(default_factory=list)
@@ -41,8 +38,6 @@ class SessionState:
     def turn_count(self):
         user_turns = sum(1 for turn in self.history if turn.get("role") == "user")
         return user_turns
-# --- End of Fix ---
-
 
 # --- System Prompt Generation ---
 
@@ -101,20 +96,26 @@ def system_message(s: SessionState, quote_allowed: bool, retrieval_ctx: Optional
     
     return {"role": "system", "content": full_prompt}
 
-# --- Session State ---
-# (This class was moved to the top)
-
 # --- Initialization Function ---
 def initialize_crisis_embeddings():
     """Called once on startup to pre-load semantic crisis phrases."""
     logging.info("Initializing crisis phrase embeddings...")
     count = 0
-    for phrase in config.CRISPY_PHRASES_SEMANTIC:
+    
+    # ★★★ TYPO FIX ★★★
+    # Changed "CRISPY_PHRASES_SEMANTIC" to "CRISIS_PHRASES_SEMANTIC"
+    for phrase in config.CRISIS_PHRASES_SEMANTIC:
+    # ★★★ END FIX ★★★
+    
         embedding = rag.get_embedding(phrase)
         if embedding:
             CRISIS_EMBEDDINGS[phrase] = embedding
             count += 1
-    logging.info(f"Successfully created {count} of {len(config.CRISPY_PHRASES_SEMANTIC)} crisis embeddings.")
+            
+    # ★★★ TYPO FIX ★★★
+    # Changed "CRISPY_PHRASES_SEMANTIC" to "CRISIS_PHRASES_SEMANTIC"
+    logging.info(f"Successfully created {count} of {len(config.CRISIS_PHRASES_SEMANTIC)} crisis embeddings.")
+    # ★★★ END FIX ★★★
 
 # --- Keyword & Typo Checking Functions ---
 
@@ -284,8 +285,10 @@ def update_session_state(msg: str, s: SessionState) -> None:
                     s.escalate_status = "crisis"
                     return
     except Exception as e:
-        # This can happen if OpenAI moderation blocks the embedding request
-        logging.warning(f"CRISPY CHECK (Layer 2) FAILED: OpenAI moderation likely blocked the embedding. {e}")
+        # ★★★ TYPO FIX ★★★
+        # Changed "CRISPY CHECK" to "CRISIS CHECK"
+        logging.warning(f"CRISIS CHECK (Layer 2) FAILED: OpenAI moderation likely blocked the embedding. {e}")
+        # ★★★ END FIX ★★★
     
     # --- LAYER 3: Turn-Based Escalation ---
     if s.turn_count >= TURN_THRESHOLD_ESCALATE and s.escalate_status == 'none':
@@ -307,7 +310,7 @@ def apply_referral_footer(text: str, s: SessionState) -> str:
     elif s.escalate_status == "needs_review":
         standard_offer = "Would you like help connecting with a faith leader from your tradition?"
         # Check if the AI *already* said something similar
-        last_part = text[-len(standard_offer)*2:]
+        last_part = text[-len(standard_offsert)*2:]
         if "faith leader" not in last_part.lower() and "spiritual leader" not in last_part.lower():
             footer += f"\n\n{standard_offer}"
 
