@@ -1,7 +1,8 @@
 # logic.py
 #
 # This file holds all the "business logic" for the chatbot.
-# This version fixes the "CRISPY" typo.
+# This final version removes the "dead code" for the
+# "UNKNOWN" faith state, since we always default to Christian.
 
 import re
 from typing import Dict, List, Optional, Iterable
@@ -41,7 +42,18 @@ class SessionState:
 
 # --- System Prompt Generation ---
 
-SYSTEM_BASE_FLOW = """You are the Fight Chaplain. Speak like a calm spiritual guide, specifically for combat sports athletes. Your primary role is to listen empathetically, using respectful, unisex language. Acknowledge the **courage, grit, and spiritual calling** required to face challenges both **in the ring** and in life. Start by acknowledging the user's current state. Keep responses warm and spiritually grounded—not a therapist, not a chatbot."""
+SYSTEM_BASE_FLOW = """You are the Fight Chaplain. Speak *always* like a calm, spiritual guide for combat sports athletes. Your tone is respectful, grounded, and uses unisex language.
+
+**Your Core Process for Responding:**
+1.  **Acknowledge the User:** Always begin by acknowledging their emotional or spiritual state.
+2.  **Warrior Greeting (for simple greetings):** If the user's message is just a simple greeting (like 'hi', 'hello'), your acknowledgment *is* the official warrior greeting. You MUST respond with a message that:
+    * Speaks to their role as a **warrior**.
+    * References their **courage** and **grit** for competition.
+    * (e.g., "Greetings, warrior. In the arena of life, your courage and grit shine...")
+3.  **Tone:** In *all* responses, weave in themes of **courage, grit, spiritual calling,** and **"the ring"** naturally.
+4.  **First Message Rule:** If this is the user's *first* message, you MUST also ask them if they are guided by a particular faith.
+5.  **Guide, Not Bot:** Speak like a guide, NOT a therapist or a generic chatbot.
+"""
 
 def system_message(s: SessionState, quote_allowed: bool, retrieval_ctx: Optional[str]) -> Dict[str, str]:
     """
@@ -51,11 +63,12 @@ def system_message(s: SessionState, quote_allowed: bool, retrieval_ctx: Optional
     rag_instruction = ""
     initial_response_guidance = ""
 
-    if s.turn_count <= 1 and not retrieval_ctx:
-        initial_response_guidance = "Keep your initial responses very concise (1-2 sentences), focusing on listening and empathy."
+    if s.turn_count <= 1:
+        initial_response_guidance = "This is the user's first message; follow the 'First Message Rule' in your core process."
     elif retrieval_ctx:
         initial_response_guidance = "The user has shared a concern and a relevant scripture was found. Respond with empathy and elaborate gently on how the retrieved verse might apply to their feeling."
     
+    # --- ★★★ This logic is now cleaner ★★★
     if quote_allowed and retrieval_ctx:
         rag_instruction = (
             "A relevant scripture 'Passage' is provided below. This 'Passage' may contain both a text and its reference."
@@ -64,23 +77,21 @@ def system_message(s: SessionState, quote_allowed: bool, retrieval_ctx: Optional
             "3. Do NOT separate the text from its citation. Do NOT invent a citation if one is not provided. "
             "4. NEVER invent a quote or passage, even if the user asks for one. If no scripture is provided below, you MUST NOT provide one."
         )
-    elif s.faith:
+    else:
+        # This is the *only* other possibility.
+        # s.faith will *always* have a value (e.g., "bible_nrsv")
+        # so this block now correctly handles "no scripture found."
         rag_instruction = (
             f"Their faith ({FAITH_DISPLAY_NAMES.get(s.faith, s.faith)}) is known, but no scripture was retrieved. "
             "Respond with empathy and practical support. "
             "**CRITICAL:** Do NOT provide a scripture quote. Do NOT invent a quote. Do NOT make up a reference, even if the user asks. "
             "Politely support them without scripture."
         )
-    else:
-        rag_instruction = (
-            "Their faith is UNKNOWN. Do not provide scripture. "
-            "Gently ask them to share their faith tradition if they are seeking scriptural support. "
-            "Do NOT invent a quote."
-        )
+    # --- ★★★ End of Fix ★★★
 
     escalation_note = f"Escalation Status: {s.escalate_status}."
     session_status = (
-        f"Faith set={s.faith or 'bible_nrsv (Assumed)'}. "
+        f"Faith set={s.faith or 'bible_nrsv (Assumed)'}. " # This part is just a failsafe for logging
         f"User Turn={s.turn_count}. "
         f"Quote allowed={quote_allowed and bool(retrieval_ctx)}. "
         f"{escalation_note}"
@@ -101,21 +112,12 @@ def initialize_crisis_embeddings():
     """Called once on startup to pre-load semantic crisis phrases."""
     logging.info("Initializing crisis phrase embeddings...")
     count = 0
-    
-    # ★★★ TYPO FIX ★★★
-    # Changed "CRISPY_PHRASES_SEMANTIC" to "CRISIS_PHRASES_SEMANTIC"
     for phrase in config.CRISIS_PHRASES_SEMANTIC:
-    # ★★★ END FIX ★★★
-    
         embedding = rag.get_embedding(phrase)
         if embedding:
             CRISIS_EMBEDDINGS[phrase] = embedding
             count += 1
-            
-    # ★★★ TYPO FIX ★★★
-    # Changed "CRISPY_PHRASES_SEMANTIC" to "CRISIS_PHRASES_SEMANTIC"
     logging.info(f"Successfully created {count} of {len(config.CRISIS_PHRASES_SEMANTIC)} crisis embeddings.")
-    # ★★★ END FIX ★★★
 
 # --- Keyword & Typo Checking Functions ---
 
@@ -153,7 +155,10 @@ def _check_for_keywords_with_typo_tolerance(msg: str, keywords: Iterable[str]) -
 # --- State Management Functions ---
 
 def try_set_faith(msg: str, s: SessionState) -> bool:
-    """Checks message for faith keywords and updates session."""
+    """
+    Checks message for faith keywords and updates session.
+    If no faith is ever found, it defaults to "bible_nrsv".
+    """
     matched_keyword = _check_for_keywords_with_typo_tolerance(msg, config.FAITH_KEYWORDS.keys())
     
     if matched_keyword:
@@ -162,6 +167,7 @@ def try_set_faith(msg: str, s: SessionState) -> bool:
             s.faith = new_faith
             return True
     
+    # This is the default rule that makes the "UNKNOWN" state impossible.
     if s.faith is None:
         s.faith = "bible_nrsv"
         return False
@@ -204,7 +210,7 @@ def _get_hypothetical_document(user_message: str, faith: str) -> str:
         )
         hypothetical_doc = completion.choices[0].message.content
         hypothetical_doc_clean = hypothetical_doc.strip().strip('"').strip("'")
-        logging.info(f"HyDE: Generated hypothetical doc: '{hypothetical_doc_clean[:100]}...'")
+        logging.info(f"HyDE: Generated hypothetical doc: '{hypotical_doc_clean[:100]}...'")
         return hypothetical_doc_clean if hypothetical_doc_clean else user_message
     except Exception as e:
         logging.error(f"ERROR during HyDE document generation: {e}")
@@ -217,6 +223,7 @@ def get_rag_context(msg: str, s: SessionState) -> Optional[str]:
     and "pre-bakes" it for the LLM.
     """
     if not s.faith:
+        # This log is now just a "just-in-case"
         logging.error("RAG check: Faith is None, THIS SHOULD NOT HAPPEN.")
         s.faith = "bible_nrsv"
 
@@ -285,10 +292,8 @@ def update_session_state(msg: str, s: SessionState) -> None:
                     s.escalate_status = "crisis"
                     return
     except Exception as e:
-        # ★★★ TYPO FIX ★★★
-        # Changed "CRISPY CHECK" to "CRISIS CHECK"
+        # This can happen if OpenAI moderation blocks the embedding request
         logging.warning(f"CRISIS CHECK (Layer 2) FAILED: OpenAI moderation likely blocked the embedding. {e}")
-        # ★★★ END FIX ★★★
     
     # --- LAYER 3: Turn-Based Escalation ---
     if s.turn_count >= TURN_THRESHOLD_ESCALATE and s.escalate_status == 'none':
@@ -310,7 +315,7 @@ def apply_referral_footer(text: str, s: SessionState) -> str:
     elif s.escalate_status == "needs_review":
         standard_offer = "Would you like help connecting with a faith leader from your tradition?"
         # Check if the AI *already* said something similar
-        last_part = text[-len(standard_offsert)*2:]
+        last_part = text[-len(standard_offer)*2:]
         if "faith leader" not in last_part.lower() and "spiritual leader" not in last_part.lower():
             footer += f"\n\n{standard_offer}"
 
