@@ -14,24 +14,15 @@ load_dotenv()
 
 # --- API and Model Configuration ---
 
-# Load the OpenAI API key from environment variables.
-# If it's not found, it defaults to an empty string.
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-
-# Define the AI models we want to use
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
 
-# A quick check to warn you if the API key is missing when the server starts
 if not OPENAI_API_KEY:
     print("WARNING: OPENAI_API_KEY environment variable not found.")
 
 # --- Faith Mapping ---
-
-# This dictionary maps keywords a user might say to the
-# specific "source" name we use in our Pinecone database.
-# For example, if a user says "catholic" or "jesus", we
-# know to search the "bible_nrsv" data.
+# (This section is unchanged)
 FAITH_KEYWORDS = {
     # Catholic uses the NRSV translation
     "catholic": "bible_nrsv",
@@ -77,11 +68,8 @@ FAITH_KEYWORDS = {
 }
 
 # --- RAG Trigger Keywords ---
+# (This section is unchanged)
 
-# (UNCHANGED)
-# These are keywords that indicate a user is in a state of
-# distress. If we detect one of these, we are more likely
-# to trigger a scripture search (RAG).
 DISTRESS_KEYWORDS = {
     # Fear / Anxiety
     "afraid", "alone", "anxiety", "anxious", "apprehensive", "dread",
@@ -107,9 +95,6 @@ DISTRESS_KEYWORDS = {
     "terrible", "tired", "trouble", "weak", "worn out"
 }
 
-# (UNCHANGED)
-# These are keywords that show a user is *explicitly*
-# asking for guidance or scripture.
 ASK_WORDS = {
     "advise", "advice",
     "bible",
@@ -126,13 +111,20 @@ ASK_WORDS = {
     "wisdom"
 }
 
-# --- Escalation Keywords ---
+# --- ★★★ UPDATED: Layered Escalation Keywords ★★★ ---
 
-# ★★★ UPDATED FOR SEMANTIC SEARCH ★★★
-# This is now a LIST of full PHRASES, not a set of words.
-# Our new code will embed these phrases and check for *semantic similarity*
-# to the user's message, which is far more robust than a keyword check.
-CRISIS_KEYWORDS = [
+# LAYER 1: IMMEDIATE (Non-AI Check)
+# These are high-lethality keywords. We check these *first*
+# with the typo-tolerance function. This check is fast, free,
+# and CANNOT be blocked by OpenAI's moderation.
+CRISIS_KEYWORDS_IMMEDIATE = {
+    "suicide", "kill myself", "hopeless", "can't go on", "want to die"
+}
+
+# LAYER 2: SEMANTIC (AI Check)
+# This is the list of full phrases for our *semantic* check.
+# This will only run if the LAYER 1 check passes.
+CRISIS_PHRASES_SEMANTIC = [
     "I am suicidal",
     "I want to kill myself",
     "I want to die",
