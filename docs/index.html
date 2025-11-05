@@ -150,7 +150,7 @@
                                     for (const char of obj.text) {
                                         fullBotResponse += char;
                                         msgSpan.textContent = fullBotResponse;
-                                        await new Promise(resolve => setTimeout(resolve, 2));
+                                        await new Promise(resolve => setTimeout(resolve, 0));
                                     }
                                 }
                             } catch (e) { /* ignore */ }

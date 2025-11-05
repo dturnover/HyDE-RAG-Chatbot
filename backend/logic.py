@@ -1,9 +1,7 @@
 # logic.py
 #
 # This file holds all the "business logic" for the chatbot.
-# This FINAL version includes:
-# 1. The "pre-baked" citation fix (to stop LLM formatting)
-# 2. The correct Qur'an citation cleaner (keeps chapter name)
+# This final version has the updated "fighter-oriented" personality.
 
 import re
 from typing import Dict, List, Optional, Iterable
@@ -28,6 +26,65 @@ FAITH_DISPLAY_NAMES = {
     "gita": "Hindu (Bhagavad Gita)",
     "dhammapada": "Buddhist (Dhammapada)",
 }
+
+# --- System Prompt Generation ---
+
+# ★★★ THIS IS THE UPDATED PERSONALITY PROMPT ★★★
+SYSTEM_BASE_FLOW = """You are the Fight Chaplain. Speak like a calm spiritual guide, specifically for combat sports athletes. Your primary role is to listen empathetically, using respectful, unisex language. Acknowledge the **courage, grit, and spiritual calling** required to face challenges both **in the ring** and in life. Start by acknowledging the user's current state. Keep responses warm and spiritually grounded—not a therapist, not a chatbot."""
+# ★★★ END OF UPDATE ★★★
+
+def system_message(s: SessionState, quote_allowed: bool, retrieval_ctx: Optional[str]) -> Dict[str, str]:
+    """
+    Builds the final "system message" (the AI's instructions)
+    based on the current session state.
+    """
+    rag_instruction = ""
+    initial_response_guidance = ""
+
+    if s.turn_count <= 1 and not retrieval_ctx:
+        initial_response_guidance = "Keep your initial responses very concise (1-2 sentences), focusing on listening and empathy."
+    elif retrieval_ctx:
+        initial_response_guidance = "The user has shared a concern and a relevant scripture was found. Respond with empathy and elaborate gently on how the retrieved verse might apply to their feeling."
+    
+    if quote_allowed and retrieval_ctx:
+        rag_instruction = (
+            "A relevant scripture 'Passage' is provided below. This 'Passage' may contain both a text and its reference."
+            "1. You MUST weave a short, direct quote from this 'Passage' into your response. "
+            "2. **CRITICAL:** If the 'Passage' includes a citation (prefixed with —), you MUST include that citation *exactly as provided* at the end of your quote. "
+            "3. Do NOT separate the text from its citation. Do NOT invent a citation if one is not provided. "
+            "4. NEVER invent a quote or passage, even if the user asks for one. If no scripture is provided below, you MUST NOT provide one."
+        )
+    elif s.faith:
+        rag_instruction = (
+            f"Their faith ({FAITH_DISPLAY_NAMES.get(s.faith, s.faith)}) is known, but no scripture was retrieved. "
+            "Respond with empathy and practical support. "
+            "**CRITICAL:** Do NOT provide a scripture quote. Do NOT invent a quote. Do NOT make up a reference, even if the user asks. "
+            "Politely support them without scripture."
+        )
+    else:
+        rag_instruction = (
+            "Their faith is UNKNOWN. Do not provide scripture. "
+            "Gently ask them to share their faith tradition if they are seeking scriptural support. "
+            "Do NOT invent a quote."
+        )
+
+    escalation_note = f"Escalation Status: {s.escalate_status}."
+    session_status = (
+        f"Faith set={s.faith or 'bible_nrsv (Assumed)'}. "
+        f"User Turn={s.turn_count}. "
+        f"Quote allowed={quote_allowed and bool(retrieval_ctx)}. "
+        f"{escalation_note}"
+    )
+
+    full_prompt = (
+        f"{SYSTEM_BASE_FLOW} {initial_response_guidance}\n"
+        f"--- CONTEXT ---\n"
+        f"CURRENT SESSION STATUS: {session_status}\n"
+        f"RAG RULE: {rag_instruction}\n"
+        f"{retrieval_ctx or 'No passages retrieved.'}\n"
+    )
+    
+    return {"role": "system", "content": full_prompt}
 
 # --- Session State ---
 @dataclass
@@ -85,64 +142,6 @@ def _check_for_keywords_with_typo_tolerance(msg: str, keywords: Iterable[str]) -
                 if _edit_distance(token, keyword) <= max_diff:
                     return keyword
     return None
-
-# --- System Prompt Generation ---
-
-SYSTEM_BASE_FLOW = """You are the Fight Chaplain. Speak calmly and spiritually, like a trusted guide, using respectful, unisex language. Acknowledge the courage required for facing challenges. Your primary role is to listen empathetically and offer support grounded in faith when known. Start by acknowledging the user's current state and inviting them to share more."""
-
-def system_message(s: SessionState, quote_allowed: bool, retrieval_ctx: Optional[str]) -> Dict[str, str]:
-    """Builds the final system message (instructions) for the LLM."""
-    rag_instruction = ""
-    initial_response_guidance = ""
-
-    if s.turn_count <= 1 and not retrieval_ctx:
-        initial_response_guidance = "Keep your initial responses very concise (1-2 sentences), focusing on listening and empathy."
-    elif retrieval_ctx:
-        initial_response_guidance = "The user has shared a concern and a relevant scripture was found. Respond with empathy and elaborate gently on how the retrieved verse might apply to their feeling."
-    
-    # This is the "pre-baking" logic. We now give the LLM one field
-    # called "Passage" and tell it to copy it exactly.
-    if quote_allowed and retrieval_ctx:
-        rag_instruction = (
-            "A relevant scripture 'Passage' is provided below. This 'Passage' may contain both a text and its reference."
-            "1. You MUST weave a short, direct quote from this 'Passage' into your response. "
-            "2. **CRITICAL:** If the 'Passage' includes a citation (prefixed with —), you MUST include that citation *exactly as provided* at the end of your quote. "
-            "3. Do NOT separate the text from its citation. Do NOT invent a citation if one is not provided. "
-            "4. NEVER invent a quote or passage, even if the user asks for one. If no scripture is provided below, you MUST NOT provide one."
-        )
-    elif s.faith:
-        # This rule is also strengthened to prevent hallucination.
-        rag_instruction = (
-            f"Their faith ({FAITH_DISPLAY_NAMES.get(s.faith, s.faith)}) is known, but no scripture was retrieved. "
-            "Respond with empathy and practical support. "
-            "**CRITICAL:** Do NOT provide a scripture quote. Do NOT invent a quote. Do NOT make up a reference, even if the user asks. "
-            "Politely support them without scripture."
-        )
-    else:
-        rag_instruction = (
-            "Their faith is UNKNOWN. Do not provide scripture. "
-            "Gently ask them to share their faith tradition if they are seeking scriptural support. "
-            "Do NOT invent a quote."
-        )
-
-    escalation_note = f"Escalation Status: {s.escalate_status}."
-    session_status = (
-        f"Faith set={s.faith or 'bible_nrsv (Assumed)'}. "
-        f"User Turn={s.turn_count}. "
-        f"Quote allowed={quote_allowed and bool(retrieval_ctx)}. "
-        f"{escalation_note}"
-    )
-
-    full_prompt = (
-        f"{SYSTEM_BASE_FLOW} {initial_response_guidance}\n"
-        f"--- CONTEXT ---\n"
-        f"CURRENT SESSION STATUS: {session_status}\n"
-        f"RAG RULE: {rag_instruction}\n"
-        # retrieval_ctx now contains the "Passage:" field
-        f"{retrieval_ctx or 'No passages retrieved.'}\n"
-    )
-    
-    return {"role": "system", "content": full_prompt}
 
 # --- State Management Functions ---
 
