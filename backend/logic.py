@@ -1,7 +1,8 @@
 # logic.py
 #
 # This file holds all the "business logic" for the chatbot.
-# This final version has the updated "fighter-oriented" personality.
+# This version fixes the NameError by moving SessionState
+# to the top of the file before it is used.
 
 import re
 from typing import Dict, List, Optional, Iterable
@@ -27,11 +28,25 @@ FAITH_DISPLAY_NAMES = {
     "dhammapada": "Buddhist (Dhammapada)",
 }
 
+# --- ★★★ BUG FIX ★★★ ---
+# The SessionState class is now defined HERE, *before*
+# any functions that use it as a type hint.
+@dataclass
+class SessionState:
+    history: List[Dict[str, str]] = field(default_factory=list)
+    faith: Optional[str] = None
+    escalate_status: str = "none"
+
+    @property
+    def turn_count(self):
+        user_turns = sum(1 for turn in self.history if turn.get("role") == "user")
+        return user_turns
+# --- End of Fix ---
+
+
 # --- System Prompt Generation ---
 
-# ★★★ THIS IS THE UPDATED PERSONALITY PROMPT ★★★
 SYSTEM_BASE_FLOW = """You are the Fight Chaplain. Speak like a calm spiritual guide, specifically for combat sports athletes. Your primary role is to listen empathetically, using respectful, unisex language. Acknowledge the **courage, grit, and spiritual calling** required to face challenges both **in the ring** and in life. Start by acknowledging the user's current state. Keep responses warm and spiritually grounded—not a therapist, not a chatbot."""
-# ★★★ END OF UPDATE ★★★
 
 def system_message(s: SessionState, quote_allowed: bool, retrieval_ctx: Optional[str]) -> Dict[str, str]:
     """
@@ -87,28 +102,19 @@ def system_message(s: SessionState, quote_allowed: bool, retrieval_ctx: Optional
     return {"role": "system", "content": full_prompt}
 
 # --- Session State ---
-@dataclass
-class SessionState:
-    history: List[Dict[str, str]] = field(default_factory=list)
-    faith: Optional[str] = None
-    escalate_status: str = "none"
-
-    @property
-    def turn_count(self):
-        user_turns = sum(1 for turn in self.history if turn.get("role") == "user")
-        return user_turns
+# (This class was moved to the top)
 
 # --- Initialization Function ---
 def initialize_crisis_embeddings():
     """Called once on startup to pre-load semantic crisis phrases."""
     logging.info("Initializing crisis phrase embeddings...")
     count = 0
-    for phrase in config.CRISIS_PHRASES_SEMANTIC:
+    for phrase in config.CRISPY_PHRASES_SEMANTIC:
         embedding = rag.get_embedding(phrase)
         if embedding:
             CRISIS_EMBEDDINGS[phrase] = embedding
             count += 1
-    logging.info(f"Successfully created {count} of {len(config.CRISIS_PHRASES_SEMANTIC)} crisis embeddings.")
+    logging.info(f"Successfully created {count} of {len(config.CRISPY_PHRASES_SEMANTIC)} crisis embeddings.")
 
 # --- Keyword & Typo Checking Functions ---
 
@@ -279,7 +285,7 @@ def update_session_state(msg: str, s: SessionState) -> None:
                     return
     except Exception as e:
         # This can happen if OpenAI moderation blocks the embedding request
-        logging.warning(f"CRISIS CHECK (Layer 2) FAILED: OpenAI moderation likely blocked the embedding. {e}")
+        logging.warning(f"CRISPY CHECK (Layer 2) FAILED: OpenAI moderation likely blocked the embedding. {e}")
     
     # --- LAYER 3: Turn-Based Escalation ---
     if s.turn_count >= TURN_THRESHOLD_ESCALATE and s.escalate_status == 'none':
