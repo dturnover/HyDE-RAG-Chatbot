@@ -1,8 +1,8 @@
 # logic.py
 #
 # This file holds all the "business logic" for the chatbot.
-# This final version removes the "dead code" for the
-# "UNKNOWN" faith state, since we always default to Christian.
+# This final version has a *more concise* and less "chatty"
+# personality prompt for the warrior greeting.
 
 import re
 from typing import Dict, List, Optional, Iterable
@@ -42,18 +42,20 @@ class SessionState:
 
 # --- System Prompt Generation ---
 
-SYSTEM_BASE_FLOW = """You are the Fight Chaplain. Speak *always* like a calm, spiritual guide for combat sports athletes. Your tone is respectful, grounded, and uses unisex language.
+# ★★★ THIS IS THE UPDATED, MORE CONCISE PROMPT ★★★
+SYSTEM_BASE_FLOW = """You are the Fight Chaplain. Speak *always* like a calm, spiritual guide for combat sports athletes. Your tone is respectful, grounded, **concise,** and uses unisex language.
 
 **Your Core Process for Responding:**
 1.  **Acknowledge the User:** Always begin by acknowledging their emotional or spiritual state.
-2.  **Warrior Greeting (for simple greetings):** If the user's message is just a simple greeting (like 'hi', 'hello'), your acknowledgment *is* the official warrior greeting. You MUST respond with a message that:
-    * Speaks to their role as a **warrior**.
-    * References their **courage** and **grit** for competition.
-    * (e.g., "Greetings, warrior. In the arena of life, your courage and grit shine...")
-3.  **Tone:** In *all* responses, weave in themes of **courage, grit, spiritual calling,** and **"the ring"** naturally.
+2.  **Warrior Greeting (for simple greetings):** If the user's message is just a simple greeting (like 'hi', 'hello'), your acknowledgment *is* the official warrior greeting. You MUST respond with a *concise* message that:
+    * Speaks to their role as a **warrior** (e.g., "Greetings, warrior.").
+    * References their **courage** and **grit**.
+    * (e.g., "Greetings, warrior. It takes courage and grit to step into the ring. How is your spirit today?")
+3.  **Tone:** In *all* responses, weave in themes of **courage, grit,** and **"the ring"** naturally, but *remain concise*.
 4.  **First Message Rule:** If this is the user's *first* message, you MUST also ask them if they are guided by a particular faith.
 5.  **Guide, Not Bot:** Speak like a guide, NOT a therapist or a generic chatbot.
 """
+# ★★★ END OF UPDATE ★★★
 
 def system_message(s: SessionState, quote_allowed: bool, retrieval_ctx: Optional[str]) -> Dict[str, str]:
     """
@@ -68,7 +70,6 @@ def system_message(s: SessionState, quote_allowed: bool, retrieval_ctx: Optional
     elif retrieval_ctx:
         initial_response_guidance = "The user has shared a concern and a relevant scripture was found. Respond with empathy and elaborate gently on how the retrieved verse might apply to their feeling."
     
-    # --- ★★★ This logic is now cleaner ★★★
     if quote_allowed and retrieval_ctx:
         rag_instruction = (
             "A relevant scripture 'Passage' is provided below. This 'Passage' may contain both a text and its reference."
@@ -78,20 +79,18 @@ def system_message(s: SessionState, quote_allowed: bool, retrieval_ctx: Optional
             "4. NEVER invent a quote or passage, even if the user asks for one. If no scripture is provided below, you MUST NOT provide one."
         )
     else:
-        # This is the *only* other possibility.
-        # s.faith will *always* have a value (e.g., "bible_nrsv")
-        # so this block now correctly handles "no scripture found."
+        # This block now correctly handles "no scripture found"
+        # since s.faith will always have a default value.
         rag_instruction = (
             f"Their faith ({FAITH_DISPLAY_NAMES.get(s.faith, s.faith)}) is known, but no scripture was retrieved. "
             "Respond with empathy and practical support. "
             "**CRITICAL:** Do NOT provide a scripture quote. Do NOT invent a quote. Do NOT make up a reference, even if the user asks. "
             "Politely support them without scripture."
         )
-    # --- ★★★ End of Fix ★★★
 
     escalation_note = f"Escalation Status: {s.escalate_status}."
     session_status = (
-        f"Faith set={s.faith or 'bible_nrsv (Assumed)'}. " # This part is just a failsafe for logging
+        f"Faith set={s.faith or 'bible_nrsv (Assumed)'}. "
         f"User Turn={s.turn_count}. "
         f"Quote allowed={quote_allowed and bool(retrieval_ctx)}. "
         f"{escalation_note}"
@@ -167,7 +166,7 @@ def try_set_faith(msg: str, s: SessionState) -> bool:
             s.faith = new_faith
             return True
     
-    # This is the default rule that makes the "UNKNOWN" state impossible.
+    # This is the default rule.
     if s.faith is None:
         s.faith = "bible_nrsv"
         return False
@@ -210,7 +209,7 @@ def _get_hypothetical_document(user_message: str, faith: str) -> str:
         )
         hypothetical_doc = completion.choices[0].message.content
         hypothetical_doc_clean = hypothetical_doc.strip().strip('"').strip("'")
-        logging.info(f"HyDE: Generated hypothetical doc: '{hypotical_doc_clean[:100]}...'")
+        logging.info(f"HyDE: Generated hypothetical doc: '{hypothetical_doc_clean[:100]}...'")
         return hypothetical_doc_clean if hypothetical_doc_clean else user_message
     except Exception as e:
         logging.error(f"ERROR during HyDE document generation: {e}")
@@ -223,7 +222,6 @@ def get_rag_context(msg: str, s: SessionState) -> Optional[str]:
     and "pre-bakes" it for the LLM.
     """
     if not s.faith:
-        # This log is now just a "just-in-case"
         logging.error("RAG check: Faith is None, THIS SHOULD NOT HAPPEN.")
         s.faith = "bible_nrsv"
 
