@@ -1,8 +1,9 @@
 # logic.py
 #
 # This file holds all the "business logic" for the chatbot.
-# This final version has a *more concise* and less "chatty"
-# personality prompt for the warrior greeting.
+# This final version includes the "Smart RAG" logic:
+# - Uses HyDE for emotional queries.
+# - Uses the raw message for topic-based queries.
 
 import re
 from typing import Dict, List, Optional, Iterable
@@ -42,7 +43,6 @@ class SessionState:
 
 # --- System Prompt Generation ---
 
-# ★★★ THIS IS THE UPDATED, MORE CONCISE PROMPT ★★★
 SYSTEM_BASE_FLOW = """You are the Fight Chaplain. Speak *always* like a calm, spiritual guide for combat sports athletes. Your tone is respectful, grounded, **concise,** and uses unisex language.
 
 **Your Core Process for Responding:**
@@ -55,7 +55,6 @@ SYSTEM_BASE_FLOW = """You are the Fight Chaplain. Speak *always* like a calm, sp
 4.  **First Message Rule:** If this is the user's *first* message, you MUST also ask them if they are guided by a particular faith.
 5.  **Guide, Not Bot:** Speak like a guide, NOT a therapist or a generic chatbot.
 """
-# ★★★ END OF UPDATE ★★★
 
 def system_message(s: SessionState, quote_allowed: bool, retrieval_ctx: Optional[str]) -> Dict[str, str]:
     """
@@ -215,19 +214,40 @@ def _get_hypothetical_document(user_message: str, faith: str) -> str:
         logging.error(f"ERROR during HyDE document generation: {e}")
         return user_message
 
+# --- ★★★ UPDATED: get_rag_context (Smart RAG Logic) ★★★ ---
 def get_rag_context(msg: str, s: SessionState) -> Optional[str]:
     """
     The main RAG function.
     Gets HyDE doc, searches Pinecone, cleans the citation,
     and "pre-bakes" it for the LLM.
+    
+    ★ New: Uses HyDE for emotional requests and raw search for topic requests.
     """
     if not s.faith:
         logging.error("RAG check: Faith is None, THIS SHOULD NOT HAPPEN.")
         s.faith = "bible_nrsv"
 
     if wants_retrieval(msg):
-        search_document = _get_hypothetical_document(msg, s.faith)
-        verse_text, verse_ref = rag.find_relevant_scripture(search_document, s.faith)
+        
+        search_query = ""
+        
+        # --- New "Smart RAG" Logic ---
+        # 1. Check if the message contains an emotional/distress keyword
+        is_distress = _check_for_keywords_with_typo_tolerance(msg, config.DISTRESS_KEYWORDS)
+        
+        if is_distress:
+            # 2. It's an emotional request ("I'm sad...").
+            #    Use the advanced HyDE search.
+            logging.info("RAG: Emotional request detected, using HyDE.")
+            search_query = _get_hypothetical_document(msg, s.faith)
+        else:
+            # 3. It's just a topic request ("quote about...").
+            #    Use the user's raw message for a direct search.
+            logging.info("RAG: Topic request detected, using raw message.")
+            search_query = msg
+        # --- End New RAG Logic ---
+
+        verse_text, verse_ref = rag.find_relevant_scripture(search_query, s.faith)
 
         if verse_text:
             # --- This is our Python citation cleaner ---
