@@ -6,3 +6,4 @@ orjson==3.10.7
 openai>=1.47.0,<2
 httpx==0.27.2
 pinecone
+numpy
