@@ -1,65 +1,133 @@
 # logic.py
-# ★★★ Added a regex cleanup step in get_rag_context for Gita citations ★★★
-import re
+#
+# This file holds all the "business logic" for the chatbot.
+# It decides what to do with a user's message, manages the
+# conversation's "state" (like escalation or faith), builds the
+# instructions for the AI, and decides when to add referral footers.
+
+import re  # For "regular expressions," used for advanced text matching
 from typing import Dict, List, Optional, Iterable
-from dataclasses import dataclass, field
-import config
-import rag # Imports the updated rag module
-import logging # Added logging
+from dataclasses import dataclass, field  # A handy tool for creating simple classes
+import config  # We get all our keywords and settings from here
+import rag  # For RAG functions and the OpenAI client
+import logging  # For logging critical errors
 
-client = rag.client # Use the client initialized in rag.py
+# Use the OpenAI client that was already initialized in rag.py
+client = rag.client
 
-# --- Constants for Escalation (from config.py) ---
-TURN_THRESHOLD_ESCALATE = 5 # Example: Escalate after 5 user messages
-# Ensure CRISIS_KEYWORDS is loaded from config
-CRISIS_KEYWORDS = getattr(config, 'CRISIS_KEYWORDS', {"suicide", "kill myself", "hopeless", "can't go on", "want to die"})
+# --- Constants ---
+
+# How many user turns before we suggest a human faith leader?
+TURN_THRESHOLD_ESCALATE = 5
+
+# ★★★ NEW: A dictionary to hold our pre-calculated crisis embeddings ★★★
+CRISIS_EMBEDDINGS: Dict[str, list[float]] = {}
+
+# ★★★ NEW: The sensitivity for our crisis detection ★★★
+# A score from 0.0 to 1.0. Higher is stricter.
+# 0.85 is a good starting point, meaning "85% similar in meaning".
+CRISIS_SIMILARITY_THRESHOLD = 0.85
+
+# --- Session State ---
 
 @dataclass
 class SessionState:
-# ... (rest of SessionState class - unchanged) ...
+    """
+    A simple "container" to hold information about a single chat session.
+    We create a new one of these for every single request.
+    """
     history: List[Dict[str, str]] = field(default_factory=list)
-    faith: Optional[str] = None
-    escalate_status: str = "none" # 'none', 'needs_review', 'crisis'
+    faith: Optional[str] = None  # e.g., "bible_nrsv", "quran", "gita"
+    escalate_status: str = "none"  # Can be "none", "needs_review", or "crisis"
 
     @property
     def turn_count(self):
+        """Calculates how many turns the *user* has taken."""
         user_turns = sum(1 for turn in self.history if turn.get("role") == "user")
-        return user_turns # Count user messages
+        return user_turns
 
-# --- Keyword/Typo Functions (BUG FIXED) ---
+# --- ★★★ NEW: Initialization Function ★★★ ---
+
+def initialize_crisis_embeddings():
+    """
+    Called once by main.py on server startup.
+    This calculates the embeddings for all our crisis phrases
+    and stores them in memory for fast comparison.
+    """
+    logging.info("Initializing crisis phrase embeddings...")
+    count = 0
+    for phrase in config.CRISIS_KEYWORDS:
+        embedding = rag.get_embedding(phrase)
+        if embedding:
+            CRISIS_EMBEDDINGS[phrase] = embedding
+            count += 1
+    logging.info(f"Successfully created {count} of {len(config.CRISIS_KEYWORDS)} crisis embeddings.")
+
+# --- Keyword & Typo Checking Functions ---
+# (This function is still needed for faith and RAG triggers)
+
 def _edit_distance(s1: str, s2: str) -> int:
-# ... (rest of _edit_distance - unchanged) ...
-    if len(s1) > len(s2): s1, s2 = s2, s1
-    distances = range(len(s1) + 1) # This line is now correct
+    """
+    Calculates the "Levenshtein distance" between two strings.
+    This is a fancy way of saying "how many single-character
+    edits (inserts, deletes, substitutions) would it take
+    to change s1 into s2?"
+    
+    We use this to catch typos (e.g., "depresed" vs "depressed").
+    """
+    if len(s1) > len(s2):
+        s1, s2 = s2, s1
+
+    distances = range(len(s1) + 1)
     for i2, c2 in enumerate(s2):
         new_distances = [i2 + 1]
         for i1, c1 in enumerate(s1):
-            if c1 == c2: new_distances.append(distances[i1])
-            else: new_distances.append(1 + min((distances[i1], distances[i1 + 1], new_distances[-1])))
+            if c1 == c2:
+                new_distances.append(distances[i1])
+            else:
+                new_distances.append(1 + min((distances[i1], distances[i1 + 1], new_distances[-1])))
         distances = new_distances
     return distances[-1]
 
 def _check_for_keywords_with_typo_tolerance(msg: str, keywords: Iterable[str]) -> Optional[str]:
-# ... (rest of _check_for_keywords_with_typo_tolerance - unchanged) ...
+    """
+    Checks a message for a list of keywords, allowing for small typos.
+    
+    It first checks for an exact match. If it doesn't find one,
+    it breaks the message into individual words and checks if any
+    word is "close enough" (using _edit_distance) to a keyword.
+    """
     m = msg.lower()
-    for keyword in keywords: # Exact match first
-        if re.search(r'\b' + re.escape(keyword) + r'\b', m): return keyword
-    msg_tokens = set(re.findall(r'\w+', m)) # Typo check second
+    
+    # 1. Exact match (fast path)
     for keyword in keywords:
-        max_diff = 1 if len(keyword) <= 6 else 2; len_tolerance = 2
+        if re.search(r'\b' + re.escape(keyword) + r'\b', m):
+            return keyword
+            
+    # 2. Typo check (slower path)
+    msg_tokens = set(re.findall(r'\w+', m))  # Get all unique words
+    for keyword in keywords:
+        max_diff = 1 if len(keyword) <= 6 else 2
+        len_tolerance = 2
+        
         for token in msg_tokens:
             if abs(len(token) - len(keyword)) <= len_tolerance:
                 if _edit_distance(token, keyword) <= max_diff:
-                    return keyword
+                    return keyword  # Found a close-enough match
     return None
 
-# --- Updated System Prompt (No Competitor Assumption, Refined Tone) ---
+# --- System Prompt Generation ---
+
+# This is the base instruction for the AI, setting its personality.
 SYSTEM_BASE_FLOW = """You are the Fight Chaplain. Speak calmly and spiritually, like a trusted guide, using respectful, unisex language. Acknowledge the courage required for facing challenges. Your primary role is to listen empathetically and offer support grounded in faith when known. Start by acknowledging the user's current state and inviting them to share more."""
 
 def system_message(s: SessionState, quote_allowed: bool, retrieval_ctx: Optional[str]) -> Dict[str, str]:
-# ... (rest of system_message - unchanged from your file) ...
+    """
+    Builds the final "system message" (the AI's instructions)
+    based on the current session state.
+    """
     rag_instruction = ""
-    initial_response_guidance = "" # Keep responses concise initially
+    initial_response_guidance = ""
 
     if s.turn_count <= 1 and not retrieval_ctx:
         initial_response_guidance = "Keep your initial responses very concise (1-2 sentences), focusing on listening and empathy."
@@ -67,71 +135,102 @@ def system_message(s: SessionState, quote_allowed: bool, retrieval_ctx: Optional
         initial_response_guidance = "The user has shared a concern and a relevant scripture was found. Respond with empathy and elaborate gently on how the retrieved verse might apply to their feeling."
     
     if quote_allowed and retrieval_ctx:
-        # This RAG_RULE is now correct and flexible
-        rag_instruction = ("A relevant scripture is provided below. Weave a short, direct quote from the 'text' into your empathetic response, enclosed in quotes. "
-                           "After the quote, you MUST cite the full 'Reference' field exactly as it is provided in the context, prefixed with an em dash.")
-    elif s.faith: 
-        rag_instruction = (f"Their faith ({s.faith}) is known, but no scripture was retrieved. Respond with empathy and practical support, without mentioning scripture.")
+        rag_instruction = (
+            "A relevant scripture is provided below. Weave a short, direct quote from the 'text' into your empathetic response, enclosed in quotes. "
+            "After the quote, you MUST cite the full 'Reference' field exactly as it is provided in the context, prefixed with an em dash."
+        )
+    elif s.faith:
+        rag_instruction = (
+            f"Their faith ({s.faith}) is known, but no scripture was retrieved. Respond with empathy and practical support, without mentioning scripture."
+        )
     else:
-        rag_instruction = ("Their faith is UNKNOWN. Do not provide scripture. Gently ask them to share their faith tradition if they are seeking scriptural support.")
+        rag_instruction = (
+            "Their faith is UNKNOWN. Do not provide scripture. Gently ask them to share their faith tradition if they are seeking scriptural support."
+        )
 
     escalation_note = f"Escalation Status: {s.escalate_status}."
-    session_status = f"Faith set={s.faith or 'bible_nrsv (Assumed)'}. User Turn={s.turn_count}. Quote allowed={quote_allowed and bool(retrieval_ctx)}. {escalation_note}"
+    session_status = (
+        f"Faith set={s.faith or 'bible_nrsv (Assumed)'}. "
+        f"User Turn={s.turn_count}. "
+        f"Quote allowed={quote_allowed and bool(retrieval_ctx)}. "
+        f"{escalation_note}"
+    )
 
-    full_prompt = (f"{SYSTEM_BASE_FLOW} {initial_response_guidance}\n--- CONTEXT ---\n"
-                   f"CURRENT SESSION STATUS: {session_status}\n"
-                   f"RAG RULE: {rag_instruction}\n"
-                   f"{retrieval_ctx or 'No passages retrieved.'}\n")
+    full_prompt = (
+        f"{SYSTEM_BASE_FLOW} {initial_response_guidance}\n"
+        f"--- CONTEXT ---\n"
+        f"CURRENT SESSION STATUS: {session_status}\n"
+        f"RAG RULE: {rag_instruction}\n"
+        f"{retrieval_ctx or 'No passages retrieved.'}\n"
+    )
+    
     return {"role": "system", "content": full_prompt}
 
-# --- Faith Setting (Modified for Default Assumption) ---
+# --- State Management Functions ---
+
 def try_set_faith(msg: str, s: SessionState) -> bool:
-# ... (rest of function - unchanged from your file) ...
+    """
+    Checks the user's message for any faith-related keywords.
+    If found, it updates the session state.
+    If no faith has been set at all, it sets the default.
+    """
     matched_keyword = _check_for_keywords_with_typo_tolerance(msg, config.FAITH_KEYWORDS.keys())
+    
     if matched_keyword:
         new_faith = config.FAITH_KEYWORDS[matched_keyword]
         if s.faith != new_faith:
             s.faith = new_faith
-            logging.info(f"[DEBUG logic.py] Faith explicitly set to: {s.faith} based on keyword '{matched_keyword}'")
             return True
     
     if s.faith is None:
-        s.faith = "bible_nrsv" # Apply default Christian faith
-        logging.info(f"[DEBUG logic.py] No faith specified, defaulting to: {s.faith}")
+        s.faith = "bible_nrsv"  # Default to Christian (NRSV)
         return False
         
     return False
 
-# --- Retrieval Trigger (Unchanged) ---
 def wants_retrieval(msg: str) -> bool:
-# ... (rest of function - unchanged from your file) ...
+    """
+    Checks if the user's message implies they want scripture.
+    This is a (fast) keyword check. We run this *before*
+    the (slower) HyDE generation.
+    """
     all_trigger_keywords = config.ASK_WORDS | config.DISTRESS_KEYWORDS
     match = _check_for_keywords_with_typo_tolerance(msg, all_trigger_keywords)
-    logging.info(f"[DEBUG logic.py] wants_retrieval check on '{msg[:50]}...': Match = {match}")
     return match is not None
 
-# ★★★ "ANTIDOTE" REWRITE PROMPT (This is working well) ★★★
-def _get_rewritten_query(user_message: str) -> str:
-# ... (rest of function - unchanged from your file) ...
+# --- ★★★ UPDATED: HyDE Query Generation ★★★ ---
+def _get_hypothetical_document(user_message: str, faith: str) -> str:
+    """
+    This implements the HyDE (Hypothetical Document Embeddings) technique.
+    
+    Instead of rewriting the user's *query*, we ask the AI to write
+    a *hypothetical scripture verse* that would perfectly comfort
+    the user. We then use the embedding of this *fake verse* to
+    search for *real verses* that are similar in meaning.
+    """
     if not client:
-         logging.info("[DEBUG logic.py] OpenAI client not available, returning original query.")
-         return user_message
+        return user_message  # Fallback if OpenAI client fails
     
-    logging.info(f"[DEBUG logic.py] Rewriting query: '{user_message}'")
-    
+    # Map the internal faith name to a human-readable one
+    faith_name_map = {
+        "bible_nrsv": "Christian (Bible)",
+        "bible_asv": "Christian (Bible)",
+        "tanakh": "Jewish (Tanakh)",
+        "quran": "Muslim (Quran)",
+        "gita": "Hindu (Bhagavad Gita)",
+        "dhammapada": "Buddhist (Dhammapada)",
+    }
+    faith_display_name = faith_name_map.get(faith, "spiritual")
+
     system_prompt = (
-        "You are a search query transformation expert. Convert the user's expression of distress into a query for its *positive solution* or *hopeful antidote*. "
-        "Your query MUST focus on positive concepts like 'hope', 'strength', 'courage', 'perseverance', 'healing', or 'finding peace'. "
-        "**ABSOLUTELY DO NOT** search for the negative emotion itself (e.g., 'sadness', 'morose', 'depressed', 'failure'). "
-        "**AVOID** all themes of divine wrath, judgment, or punishment. "
-        "Transform the user's pain into a search for its cure.\n"
-        "Examples:\n"
-        "User: 'im depressed. i lost my fight yesterday'\n"
-        "Rewrite: 'Scripture about finding hope after failure' or 'verses about healing and strength in sorrow' or 'perseverance after a setback'\n"
-        "User: 'im nervous about my upcoming fight'\n"
-        "Rewrite: 'verses about courage and finding strength in God' or 'scripture for peace and overcoming anxiety' or 'trusting in divine strength'\G"
-        "User: 'i feel so weak and tired'\n"
-        "Rewrite: 'finding strength in God when weary' or 'verses about spiritual renewal and endurance'"
+        f"You are a wise theologian. A user is feeling distressed. "
+        f"Their expressed feeling is: '{user_message}'\n"
+        f"Their faith tradition is: {faith_display_name}.\n\n"
+        "Your task is to write a *single, hypothetical scripture passage* "
+        "from their tradition that would provide the perfect comfort, hope, or "
+        "strength for their situation. Write *only* the passage, as if it "
+        "were a real quote. Do not add any commentary or labels like 'Hypothetical Verse:'. "
+        "Focus on themes of hope, perseverance, and divine support."
     )
     
     try:
@@ -139,87 +238,105 @@ def _get_rewritten_query(user_message: str) -> str:
             model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_message}
             ],
             temperature=0.0,
-            max_tokens=60,
+            max_tokens=150,  # Enough for a rich verse, but not too long
             stream=False
         )
-        rewritten = completion.choices[0].message.content
-        rewritten_clean = rewritten.strip().strip('"').strip("'")
-        logging.info(f"[DEBUG logic.py] Rewritten query: '{rewritten_clean}'")
-        return rewritten_clean if rewritten_clean else user_message
+        hypothetical_doc = completion.choices[0].message.content
+        # Clean up any extra quotes the AI might have added
+        hypothetical_doc_clean = hypothetical_doc.strip().strip('"').strip("'")
+        
+        logging.info(f"HyDE: Generated hypothetical doc: '{hypothetical_doc_clean[:100]}...'")
+        
+        return hypothetical_doc_clean if hypothetical_doc_clean else user_message
     except Exception as e:
-         logging.error(f"[DEBUG logic.py] ERROR during query rewrite: {e}")
-         return user_message
+        logging.error(f"ERROR during HyDE document generation: {e}")
+        return user_message  # Fallback to the original message on error
 
-# --- RAG Context Retrieval (Updated Faith Handling) ---
 def get_rag_context(msg: str, s: SessionState) -> Optional[str]:
     """
-    Determines if RAG is needed, gets the query, calls Pinecone search,
-    and formats the result for the system prompt context. Uses default faith if needed.
+    The main function to decide if and what to retrieve from Pinecone.
     """
     if not s.faith:
-        logging.error("[DEBUG logic.py] RAG check: Faith is None, THIS SHOULD NOT HAPPEN.")
-        s.faith = "bible_nrsv" # Failsafe
+        logging.error("RAG check: Faith is None, THIS SHOULD NOT HAPPEN.")
+        s.faith = "bible_nrsv"
 
+    # 1. Decide if the user's message warrants a search (fast keyword check)
     if wants_retrieval(msg):
-        logging.info(f"[DEBUG logic.py] Retrieval triggered. Using faith: {s.faith}")
-        search_query = _get_rewritten_query(msg)
-        verse_text, verse_ref = rag.find_relevant_scripture(search_query, s.faith)
+        
+        # 2. ★★★ UPDATED: Generate a HyDE document, not a query ★★★
+        search_document = _get_hypothetical_document(msg, s.faith)
+        
+        # 3. Search Pinecone using the embedding of the *hypothetical doc*
+        verse_text, verse_ref = rag.find_relevant_scripture(search_document, s.faith)
 
         if verse_text and verse_ref:
-            # ★★★ GITA CITATION FIX ★★★
-            # Clean up the reference string ONLY if it's from the gita
+            # --- Gita Citation Fix ---
             if s.faith == "gita":
-                # Removes "Gita " from the start and ": Text " from the middle
                 cleaned_ref = re.sub(r':\s*Text\s*', ':', verse_ref).replace("Gita ", "", 1)
-                logging.info(f"[DEBUG logic.py] Cleaned Gita ref from '{verse_ref}' to '{cleaned_ref}'")
-                verse_ref = cleaned_ref # Use the cleaned version
-            # ★★★ END FIX ★★★
+                verse_ref = cleaned_ref
+            # --- End Fix ---
 
-            logging.info(f"[DEBUG logic.py] RAG context generated: Ref='{verse_ref}', Text='{verse_text[:50]}...'")
+            # 4. Format the result for the system message
             return f"RETRIEVED PASSAGE:\n- Reference: {verse_ref}\n- Text: \"{verse_text}\""
         else:
-             logging.info("[DEBUG logic.py] rag.find_relevant_scripture returned no valid hit.")
-             return None
+            return None  # We wanted to search but found nothing
     else:
-        logging.info("[DEBUG logic.py] Retrieval not triggered.")
-        return None
+        return None  # The user's message didn't trigger a search
 
-# --- Escalation & Metrics ---
+# --- ★★★ UPDATED: Escalation & Referral Functions ★★★ ---
+
 def update_session_state(msg: str, s: SessionState) -> None:
-# ... (rest of function - unchanged from your file) ...
-    logging.info(f"[DEBUG logic.py] Updating session state. Current turn: {s.turn_count}")
-    if _check_for_keywords_with_typo_tolerance(msg, CRISIS_KEYWORDS):
-        s.escalate_status = "crisis"
-        logging.info(f"[DEBUG logic.py] CRISIS KEYWORD DETECTED. Status: 'crisis'.")
-        return
+    """
+    Updates the session's escalation status using semantic search.
+    """
+    
+    # --- 1. New Semantic Crisis Check ---
+    msg_embedding = rag.get_embedding(msg)
+    
+    # We can only run this check if we got an embedding for the user's message
+    if msg_embedding and CRISIS_EMBEDDINGS:
+        for phrase, crisis_embedding in CRISIS_EMBEDDINGS.items():
+            
+            # Compare the user's message embedding to the pre-loaded crisis phrase embedding
+            similarity = rag.get_cosine_similarity(msg_embedding, crisis_embedding)
+            
+            if similarity > CRISIS_SIMILARITY_THRESHOLD:
+                # We have a strong semantic match to a crisis phrase
+                logging.warning(
+                    f"CRISIS DETECTED (Semantic Match): "
+                    f"Similarity: {similarity:.2f} to cached phrase: '{phrase}'"
+                )
+                s.escalate_status = "crisis"
+                return  # Crisis status overrides all other states
+    
+    # --- 2. Check for Turn-Based Escalation (if no crisis was detected) ---
     if s.turn_count >= TURN_THRESHOLD_ESCALATE and s.escalate_status == 'none':
         s.escalate_status = "needs_review"
-        logging.info(f"[DEBUG logic.py] Turn threshold reached. Status: 'needs_review'.")
+        logging.info(f"Turn threshold reached. Status: 'needs_review'.")
 
-# --- Referral Footer (Step 6 & 7) ---
 def apply_referral_footer(text: str, s: SessionState) -> str:
-# ... (rest of function - unchanged from your file) ...
+    """
+    Checks the final AI response and session state to see if we
+    need to add a footer message.
+    """
     footer = ""
-    crisis_referral_added = False
     text = text.strip()
 
+    # 1. Crisis: Always add the crisis text line
     if s.escalate_status == "crisis":
-        footer += ("\n\nIt sounds like you're going through a very difficult time. For immediate support, "
-                   "you can connect with people who can help by texting HOME to 741741 to reach the Crisis Text Line.")
-        logging.info("[DEBUG logic.py] Appending crisis referral footer.")
-        crisis_referral_added = True
-    
+        footer += (
+            "\n\nIt sounds like you're going through a very difficult time. For immediate support, "
+            "you can connect with people who can help by texting HOME to 741741 to reach the Crisis Text Line."
+        )
+        
+    # 2. Needs Review: Offer to connect to a human
     elif s.escalate_status == "needs_review":
         standard_offer = "Would you like help connecting with a faith leader from your tradition?"
+        
         last_part = text[-len(standard_offer)*2:]
         if "faith leader" not in last_part.lower() and "spiritual leader" not in last_part.lower():
-             footer += f"\n\n{standard_offer}"
-             logging.info("[DEBUG logic.py] Appending standard faith leader referral (turn limit reached).")
-        else:
-             logging.info("[DEBUG logic.py] Skipping standard footer (turn limit), similar text already present.")
+            footer += f"\n\n{standard_offer}"
 
     return footer
-

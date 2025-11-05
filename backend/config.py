@@ -1,24 +1,37 @@
 # config.py
-# Contains API keys, model configs, and expanded keyword lists for RAG.
-import os
-from pathlib import Path
-from dotenv import load_dotenv # Added load_dotenv
+#
+# This file is the main configuration and settings hub for the application.
+# It holds API keys, model names, and all the important keyword lists
+# that the chatbot logic uses to make decisions.
 
-# Load environment variables from .env file (if you use one)
+import os
+from dotenv import load_dotenv  # Used to load settings from a .env file
+
+# This command looks for a file named ".env" in your project
+# and loads any variables inside it into the environment.
+# This is a good way to keep secret API keys out of your code.
 load_dotenv()
 
 # --- API and Model Configuration ---
-# (Using your os.getenv structure)
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-EMBED_MODEL    = os.getenv("EMBED_MODEL", "text-embedding-3-small")
 
-# Check if the key is loaded
+# Load the OpenAI API key from environment variables.
+# If it's not found, it defaults to an empty string.
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+
+# Define the AI models we want to use
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
+
+# A quick check to warn you if the API key is missing when the server starts
 if not OPENAI_API_KEY:
     print("WARNING: OPENAI_API_KEY environment variable not found.")
 
 # --- Faith Mapping ---
-# (Using your provided map, expanded with other faiths)
+
+# This dictionary maps keywords a user might say to the
+# specific "source" name we use in our Pinecone database.
+# For example, if a user says "catholic" or "jesus", we
+# know to search the "bible_nrsv" data.
 FAITH_KEYWORDS = {
     # Catholic uses the NRSV translation
     "catholic": "bible_nrsv",
@@ -31,12 +44,12 @@ FAITH_KEYWORDS = {
     "lutheran": "bible_asv",
     "anglican": "bible_nrsv",
     "evangelical": "bible_asv",
-    "orthodox": "bible_nrsv", # Eastern Orthodox
+    "orthodox": "bible_nrsv",  # Eastern Orthodox
     "jesus": "bible_nrsv",
-    "bible": "bible_nrsv", # Default Bible to NRSV
-    "asv": "bible_asv", # Specific version
-    "nrsv": "bible_nrsv", # Specific version
-    "king james": "bible_asv", # Assuming ASV is closer if KJV requested
+    "bible": "bible_nrsv",  # Default Bible to NRSV
+    "asv": "bible_asv",  # Specific version
+    "nrsv": "bible_nrsv",  # Specific version
+    "king james": "bible_asv",
 
     # Jewish
     "jewish": "tanakh",
@@ -65,8 +78,10 @@ FAITH_KEYWORDS = {
 
 # --- RAG Trigger Keywords ---
 
-# Keywords indicating a state of distress
-# (Expanded to be "bulletproof")
+# (UNCHANGED)
+# These are keywords that indicate a user is in a state of
+# distress. If we detect one of these, we are more likely
+# to trigger a scripture search (RAG).
 DISTRESS_KEYWORDS = {
     # Fear / Anxiety
     "afraid", "alone", "anxiety", "anxious", "apprehensive", "dread",
@@ -92,8 +107,9 @@ DISTRESS_KEYWORDS = {
     "terrible", "tired", "trouble", "weak", "worn out"
 }
 
-# Keywords explicitly or implicitly asking for help/scripture
-# (Expanded to be "bulletproof")
+# (UNCHANGED)
+# These are keywords that show a user is *explicitly*
+# asking for guidance or scripture.
 ASK_WORDS = {
     "advise", "advice",
     "bible",
@@ -111,8 +127,19 @@ ASK_WORDS = {
 }
 
 # --- Escalation Keywords ---
-# (Added - This is CRITICAL for logic.py to run)
-CRISIS_KEYWORDS = {
-    "suicide", "kill myself", "hopeless", "can't go on", "want to die"
-}
 
+# ★★★ UPDATED FOR SEMANTIC SEARCH ★★★
+# This is now a LIST of full PHRASES, not a set of words.
+# Our new code will embed these phrases and check for *semantic similarity*
+# to the user's message, which is far more robust than a keyword check.
+CRISIS_KEYWORDS = [
+    "I am suicidal",
+    "I want to kill myself",
+    "I want to die",
+    "I don't want to live anymore",
+    "I don't want to be here anymore",
+    "I feel completely hopeless",
+    "I can't go on",
+    "My life isn't worth living",
+    "I'm going to end it all"
+]
