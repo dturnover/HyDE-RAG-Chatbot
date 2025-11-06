@@ -199,7 +199,7 @@ def _get_hypothetical_document(user_message: str, faith: str) -> str:
             messages=[
                 {"role": "system", "content": system_prompt},
             ],
-            temperature=0.0,
+            temperature=0.4,
             max_tokens=150,
             stream=False
         )
