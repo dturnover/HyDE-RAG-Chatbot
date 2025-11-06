@@ -1,9 +1,8 @@
 # logic.py
 #
-# This file holds all the "business logic" for the chatbot.
-# This final version includes the "Smart RAG" logic:
-# - Uses HyDE for emotional queries.
-# - Uses the raw message for topic-based queries.
+# This is the final version. It *removes* the
+# onboarding logic from the prompt, as the client's
+# WordPress plugin already handles the first message.
 
 import re
 from typing import Dict, List, Optional, Iterable
@@ -43,18 +42,17 @@ class SessionState:
 
 # --- System Prompt Generation ---
 
+# ★★★ THIS IS THE FINAL, SIMPLIFIED PROMPT ★★★
+# It no longer has the "onboarding" or "warrior greeting" rules,
+# as the client's plugin handles the first message.
 SYSTEM_BASE_FLOW = """You are the Fight Chaplain. Speak *always* like a calm, spiritual guide for combat sports athletes. Your tone is respectful, grounded, **concise,** and uses unisex language.
 
 **Your Core Process for Responding:**
 1.  **Acknowledge the User:** Always begin by acknowledging their emotional or spiritual state.
-2.  **Warrior Greeting (for simple greetings):** If the user's message is just a simple greeting (like 'hi', 'hello'), your acknowledgment *is* the official warrior greeting. You MUST respond with a *concise* message that:
-    * Speaks to their role as a **warrior** (e.g., "Greetings, warrior.").
-    * References their **courage** and **grit**.
-    * (e.g., "Greetings, warrior. It takes courage and grit to step into the ring. How is your spirit today?")
-3.  **Tone:** In *all* responses, weave in themes of **courage, grit,** naturally, but *remain concise*.
-4.  **First Message Rule:** If this is the user's *first* message, you MUST also ask them if they are guided by a particular faith.
-5.  **Guide, Not Bot:** Speak like a guide, NOT a therapist or a generic chatbot.
+2.  **Tone:** In *all* responses, weave in themes of **courage, grit, spiritual calling,** and **"the ring"** naturally, but *remain concise*.
+3.  **Guide, Not Bot:** Speak like a guide, NOT a therapist or a generic chatbot.
 """
+# ★★★ END OF UPDATE ★★★
 
 def system_message(s: SessionState, quote_allowed: bool, retrieval_ctx: Optional[str]) -> Dict[str, str]:
     """
@@ -64,9 +62,8 @@ def system_message(s: SessionState, quote_allowed: bool, retrieval_ctx: Optional
     rag_instruction = ""
     initial_response_guidance = ""
 
-    if s.turn_count <= 1:
-        initial_response_guidance = "This is the user's first message; follow the 'First Message Rule' in your core process."
-    elif retrieval_ctx:
+    # We no longer need a special rule for turn_count <= 1
+    if retrieval_ctx:
         initial_response_guidance = "The user has shared a concern and a relevant scripture was found. Respond with empathy and elaborate gently on how the retrieved verse might apply to their feeling."
     
     if quote_allowed and retrieval_ctx:
@@ -214,14 +211,13 @@ def _get_hypothetical_document(user_message: str, faith: str) -> str:
         logging.error(f"ERROR during HyDE document generation: {e}")
         return user_message
 
-# --- ★★★ UPDATED: get_rag_context (Smart RAG Logic) ★★★ ---
 def get_rag_context(msg: str, s: SessionState) -> Optional[str]:
     """
     The main RAG function.
     Gets HyDE doc, searches Pinecone, cleans the citation,
     and "pre-bakes" it for the LLM.
     
-    ★ New: Uses HyDE for emotional requests and raw search for topic requests.
+    Uses HyDE for emotional requests and raw search for topic requests.
     """
     if not s.faith:
         logging.error("RAG check: Faith is None, THIS SHOULD NOT HAPPEN.")
@@ -231,21 +227,18 @@ def get_rag_context(msg: str, s: SessionState) -> Optional[str]:
         
         search_query = ""
         
-        # --- New "Smart RAG" Logic ---
-        # 1. Check if the message contains an emotional/distress keyword
+        # --- "Smart RAG" Logic ---
         is_distress = _check_for_keywords_with_typo_tolerance(msg, config.DISTRESS_KEYWORDS)
         
         if is_distress:
-            # 2. It's an emotional request ("I'm sad...").
-            #    Use the advanced HyDE search.
+            # It's an emotional request ("I'm sad..."). Use HyDE.
             logging.info("RAG: Emotional request detected, using HyDE.")
             search_query = _get_hypothetical_document(msg, s.faith)
         else:
-            # 3. It's just a topic request ("quote about...").
-            #    Use the user's raw message for a direct search.
+            # It's just a topic request ("quote about..."). Use raw message.
             logging.info("RAG: Topic request detected, using raw message.")
             search_query = msg
-        # --- End New RAG Logic ---
+        # --- End RAG Logic ---
 
         verse_text, verse_ref = rag.find_relevant_scripture(search_query, s.faith)
 
