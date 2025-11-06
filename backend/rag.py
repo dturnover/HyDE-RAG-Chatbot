@@ -1,36 +1,33 @@
 # rag.py
 #
-# This file handles the "Retrieval-Augmented Generation" (RAG) part.
-# Its main jobs are:
-# 1. Connecting to the OpenAI and Pinecone API services.
-# 2. Creating a "vector embedding" (a number-based version) of a text query.
-# 3. Searching the Pinecone vector database to find the most relevant scripture.
-# 4. Providing utility functions like cosine similarity.
+# This file handles all "Retrieval-Augmented Generation" (RAG) tasks.
+# Its job is to connect to our AI (OpenAI) and our vector database
+# (Pinecone), search for relevant scriptures, and return the best match.
 
 import os
 import re
 from openai import OpenAI
 from pinecone import Pinecone
-import logging  # We use logging for important messages and errors
-import numpy as np  # ★★★ NEW: Added for cosine similarity math ★★★
+import logging
+import numpy as np  # Used for vector math (cosine similarity)
+import random       # Used to pick a random result from top candidates
 
-# Set up the logger for this file
+# Set up the main logger for this file
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# --- Initialize OpenAI and Pinecone Clients ---
+# --- Initialize API Clients ---
 
-# We'll try to connect to the APIs right when the server starts.
-# If this fails, the server will stop with an error, which is
-# good because the app can't run without these connections.
+# This code runs *once* when the server starts.
+# It connects to OpenAI and Pinecone using API keys from the environment.
 try:
-    # This is the OpenAI client, used for embeddings and chat
+    # Connect to OpenAI
     client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
     
-    # These are the details for our Pinecone vector database
+    # Get Pinecone credentials
     pinecone_api_key = os.environ.get("PINECONE_API_KEY")
     pinecone_index_name = os.environ.get("PINECONE_INDEX_NAME")
     
-    # Check if the environment variables were actually found
+    # Check that all keys were successfully loaded
     if not client.api_key:
         raise ValueError("OPENAI_API_KEY missing from environment variables.")
     if not pinecone_api_key:
@@ -38,44 +35,44 @@ try:
     if not pinecone_index_name:
         raise ValueError("PINECONE_INDEX_NAME missing from environment variables.")
 
+    # Connect to Pinecone
     logging.info("Initializing Pinecone client...")
     pc = Pinecone(api_key=pinecone_api_key)
     
+    # Check if the specific index (our database) exists
     logging.info(f"Checking if index '{pinecone_index_name}' exists...")
     if pinecone_index_name not in pc.list_indexes().names():
         raise ValueError(f"Pinecone index '{pinecone_index_name}' was not found.")
 
-    # Connect to our specific index
+    # Get the specific index object we'll be searching
     index = pc.Index(pinecone_index_name)
     logging.info(f"Successfully connected to Pinecone index '{pinecone_index_name}'.")
     
     try:
-        # Just to be sure, print some stats about the index
+        # Log stats to confirm the connection is good
         logging.info(f"Index stats: {index.describe_index_stats()}")
     except Exception as stats_e:
         logging.warning(f"Could not retrieve initial index stats: {stats_e}")
 
 except Exception as e:
+    # If any connection fails, log the fatal error and stop the server.
     logging.error(f"FATAL ERROR during API client initialization: {e}")
-    # If we failed, set these to None so other files know
     client = None
     index = None
-    # Stop the program from continuing
     raise RuntimeError(f"Failed to initialize API clients: {e}") from e
 
 # --- Core RAG Functions ---
 
 def get_embedding(text: str, model="text-embedding-3-small") -> list[float] | None:
     """
-    Generates a vector "embedding" for a piece of text using OpenAI.
-    An embedding is just a long list of numbers that represents
-    the *meaning* of the text.
+    Converts a string of text into a vector embedding (a list of numbers)
+    using OpenAI's embedding model.
     """
     if not client:
         logging.error("OpenAI client not initialized.")
         return None
     try:
-        # Replace newlines with spaces, as it's better for embedding models
+        # OpenAI models prefer text with no newlines
         text = text.replace("\n", " ")
         response = client.embeddings.create(input=[text], model=model)
         
@@ -90,10 +87,8 @@ def get_embedding(text: str, model="text-embedding-3-small") -> list[float] | No
 
 def pinecone_search(query_embedding: list[float], faith_filter: str, top_k=5) -> list:
     """
-    Searches the Pinecone index for the most relevant scriptures.
-    
-    It uses the `query_embedding` (the numbers) to find the *closest*
-    matches and filters the results by `faith_filter` (e.g., "quran", "bible_nrsv").
+    Searches the Pinecone index for the 'top_k' most similar vectors
+    to the query_embedding, filtering by the 'faith_filter' (e.g., "quran").
     """
     if not index:
         logging.error("Pinecone index not initialized.")
@@ -106,18 +101,18 @@ def pinecone_search(query_embedding: list[float], faith_filter: str, top_k=5) ->
         return []
         
     try:
-        # This is the actual search query to Pinecone
+        # Query the index
         query_results = index.query(
             vector=query_embedding,
-            filter={"source": faith_filter},  # Only search within this faith
-            top_k=top_k,                     # Get the top 5 matches
-            include_metadata=True            # We need this to get the text and reference
+            filter={"source": faith_filter},  # e.g., {"source": "bible_nrsv"}
+            top_k=top_k,
+            include_metadata=True  # This is critical to get the text and ref
         )
         
+        # Format the raw Pinecone results into a simple list
         results_list = []
         if query_results and query_results.get('matches'):
             for match in query_results['matches']:
-                # Pull the data out of the "metadata"
                 metadata = match.get('metadata', {})
                 text = metadata.get('text')
                 ref = metadata.get('ref')
@@ -129,7 +124,6 @@ def pinecone_search(query_embedding: list[float], faith_filter: str, top_k=5) ->
                     logging.warning(f"A match (ID: {match.get('id')}) was missing 'text' or 'ref' in its metadata.")
             return results_list
         else:
-            # This is a normal event, not an error.
             logging.info(f"No matches found in Pinecone for filter '{faith_filter}'.")
             return []
     except Exception as e:
@@ -140,40 +134,29 @@ def pinecone_search(query_embedding: list[float], faith_filter: str, top_k=5) ->
 
 def clean_verse(text: str) -> str:
     """
-    A simple helper function to clean up scripture text.
-    It removes things like [1] footnote numbers and extra spaces.
+    A simple helper to remove common clutter (like footnote numbers)
+    from the retrieved scripture text.
     """
     if not text:
         return ""
-    text = re.sub(r'\[\d+\]', '', text)  # Remove [1], [2], etc.
+    text = re.sub(r'\[\d+\]', '', text)  # Removes [1], [2], etc.
     text = text.replace("...", "").replace("..", ".")
-    text = re.sub(r'\s+', ' ', text).strip()  # Replace multiple spaces with one
+    text = re.sub(r'\s+', ' ', text).strip()  # Replaces multiple spaces with one
     return text
 
-# ★★★ NEW: Cosine Similarity Function ★★★
 def get_cosine_similarity(v1: list[float], v2: list[float]) -> float:
     """
-    Calculates the cosine similarity between two embedding vectors.
-    Returns a score between -1 and 1 (or 0 and 1 for OpenAI embeddings).
-    A score closer to 1 means the vectors are very similar in meaning.
+    Calculates the similarity (from -1 to 1) between two embedding vectors.
+    This is used by the crisis-checking logic.
     """
     try:
-        # Convert lists to numpy arrays for efficient math
         v1_np = np.array(v1)
         v2_np = np.array(v2)
-        
-        # Calculate the dot product
         dot_product = np.dot(v1_np, v2_np)
-        
-        # Calculate the magnitudes (norms) of the vectors
         norm_v1 = np.linalg.norm(v1_np)
         norm_v2 = np.linalg.norm(v2_np)
-        
-        # Check for zero vectors to avoid division by zero
         if norm_v1 == 0 or norm_v2 == 0:
             return 0.0
-            
-        # Calculate the cosine similarity
         return dot_product / (norm_v1 * norm_v2)
     except Exception as e:
         logging.error(f"Error calculating cosine similarity: {e}", exc_info=True)
@@ -181,13 +164,13 @@ def get_cosine_similarity(v1: list[float], v2: list[float]) -> float:
 
 # --- Main Orchestration Function ---
 
-# ★★★ UPDATED with better error logging ★★★
 def find_relevant_scripture(transformed_query: str, faith_context: str) -> tuple[str | None, str | None]:
     """
-    This is the main function that ties everything in this file together.
+    Finds the single most relevant scripture using Pinecone.
     
-    It takes the "antidote" query and the faith, gets the embedding,
-    searches Pinecone, and returns the single best result.
+    This is the main function called by logic.py. It ties everything
+    together: gets the embedding, searches Pinecone, and then
+    randomly picks from the best results to avoid repetition.
     """
     if not transformed_query:
         logging.warning("find_relevant_scripture called with an empty query.")
@@ -196,22 +179,20 @@ def find_relevant_scripture(transformed_query: str, faith_context: str) -> tuple
         logging.warning("find_relevant_scripture called with an empty faith.")
         return None, None
     if not index or not client:
-        # This is a critical, app-breaking error
         logging.error("RAG clients are not initialized, cannot find scripture.")
         return None, None
 
-    # 1. Turn the text query into numbers (embedding)
+    # 1. Get embedding for the search query
     try:
         query_embedding = get_embedding(transformed_query)
         if not query_embedding:
-            # get_embedding already logs its own errors, but we'll log the failure.
             logging.error(f"Failed to get embedding for query: '{transformed_query}', aborting search.")
             return None, None
     except Exception as e:
         logging.error(f"An unexpected error occurred during get_embedding: {e}", exc_info=True)
         return None, None
 
-    # 2. Search Pinecone
+    # 2. Search Pinecone for the top 5 results
     try:
         search_results = pinecone_search(query_embedding, faith_context, top_k=5)
     except Exception as e:
@@ -220,27 +201,53 @@ def find_relevant_scripture(transformed_query: str, faith_context: str) -> tuple
 
     # 3. Process results
     if not search_results:
-        # This is not an error, it's just a "no match found."
         logging.info(f"No scripture found from Pinecone search for query: '{transformed_query}'")
         return None, None
         
-    # Find the best, highest-quality match
+    # --- Randomization Logic to Prevent Repetition ---
+    
+    # 3a. Get the #1 score
+    top_score = search_results[0].get('score', 0.0)
+    
+    # 3b. Set a threshold (must be at least 95% as good as the top score)
+    score_threshold = top_score * 0.95 
+    
+    # 3c. Create a list of all "good enough" candidates
+    candidates = [
+        match for match in search_results 
+        if match.get('score', 0.0) >= score_threshold
+    ]
+    
+    # 3d. Find all *valid* candidates from that list (long enough, has text/ref)
+    valid_candidates = []
+    for match in candidates:
+        text = match.get('text')
+        ref = match.get('ref')
+        if text and ref:
+            cleaned_text = clean_verse(text)
+            if len(cleaned_text.split()) >= 5: # Quality check
+                valid_candidates.append((cleaned_text, ref))
+    
+    # 3e. If we have valid, high-score candidates, pick one at random
+    if valid_candidates:
+        logging.info(f"RAG: Found {len(valid_candidates)} high-score candidates. Randomly selecting one.")
+        return random.choice(valid_candidates)
+        
+    # --- End of Randomization Logic ---
+
+    # 3f. (Fallback) If randomization logic failed (e.g., all top hits were too short),
+    # just find the first good-enough match in the *entire* list.
+    logging.warning("RAG: No valid *high-score* candidates found. Falling back to first available.")
     for best_match in search_results:
         best_text = best_match.get('text')
         best_ref = best_match.get('ref')
-        
         if best_text and best_ref:
             cleaned_text = clean_verse(best_text)
-            
-            # Quality check for verse length
-            if len(cleaned_text.split()) >= 5:
+            if len(cleaned_text.split()) >= 5: # Quality check
                 return cleaned_text, best_ref
             else:
-                # This is a useful debug log
-                logging.info(f"Skipping short match (score: {best_match.get('score', 0):.2f}): {best_ref}")
-        else:
-            logging.warning("A search match was returned but was missing text or ref metadata.")
-    
-    # If we went through all 5 and none were good enough
-    logging.info(f"No suitable (long-enough) match found in top 5 results for: '{transformed_query}'")
+                logging.info(f"Skipping short match: {best_ref}")
+
+    # If we get here, nothing was found at all
+    logging.info(f"No suitable match found in top 5 results for: '{transformed_query}'")
     return None, None
