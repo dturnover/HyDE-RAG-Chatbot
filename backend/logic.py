@@ -190,7 +190,7 @@ def _get_hypothetical_document(user_message: str, faith: str) -> str:
         "from their tradition that would provide the perfect comfort, hope, or "
         "strength for their situation. Write *only* the passage, as if it "
         "were a real quote. Do not add any commentary or labels like 'Hypothetical Verse:'. "
-        "Focus on themes of hope, perseverance, and divine support."
+        "Focus on themes of hope, perseverance, and divine support. Pay special attention to the situation they describe themselves in"
     )
     
     try:
