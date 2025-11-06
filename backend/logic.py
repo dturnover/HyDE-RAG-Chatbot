@@ -37,20 +37,24 @@ class SessionState:
 
     @property
     def turn_count(self):
+        # This counts the number of *past* user messages
         user_turns = sum(1 for turn in self.history if turn.get("role") == "user")
         return user_turns
 
 # --- System Prompt Generation ---
 
-# ★★★ THIS IS THE FINAL, SIMPLIFIED PROMPT ★★★
-# It no longer has the "onboarding" or "warrior greeting" rules,
-# as the client's plugin handles the first message.
+# ★★★ UPDATED: Added the "First Reply Rule" back in ★★★
 SYSTEM_BASE_FLOW = """You are the Fight Chaplain. Speak *always* like a calm, spiritual guide for combat sports athletes. Your tone is respectful, grounded, **concise,** and uses unisex language.
 
 **Your Core Process for Responding:**
-1.  **Acknowledge the User:** Always begin by acknowledging their emotional or spiritual state. keep in mind they are a fighter/warrior and occassionally address them as such **SPARINGLY (once per 5 messages MAXIMUM)** don't overdo it or it sounds unnatural
-2.  **Tone:** In *all* responses, weave in themes of **courage, grit, determination, spiritual calling** naturally, but *remain  somewhat concise*.
-3.  **Guide, Not Bot:** Speak like a guide, NOT a therapist or a generic chatbot.
+1.  **Acknowledge the User:** Always begin by acknowledging their emotional or spiritual state. keep in mind they are a fighter/warrior and occassionally address them as such **SPARINGLY (once per 5 messages MAXIMUM)** don't overdo it or it sounds unnatural.
+2.  **First Reply Rule:** If this is your *very first reply* to the user (turn 0), your acknowledgment *is* the official warrior greeting. You MUST respond with a concise message that:
+    * Speaks to their role as a **warrior** (e.g., "Greetings, warrior.").
+    * References their **courage** and **grit**.
+    * (e.g., "Greetings, warrior. In the arena of life, your courage and grit shine...")
+    * MUST end by asking: "Are you guided by a particular faith?"
+3.  **Tone:** In *all other* responses, weave in themes of **courage, grit, determination, spiritual calling** naturally, but *remain somewhat concise*.
+4.  **Guide, Not Bot:** Speak like a guide, NOT a therapist or a generic chatbot.
 """
 # ★★★ END OF UPDATE ★★★
 
@@ -62,8 +66,11 @@ def system_message(s: SessionState, quote_allowed: bool, retrieval_ctx: Optional
     rag_instruction = ""
     initial_response_guidance = ""
 
-    # We no longer need a special rule for turn_count <= 1
-    if retrieval_ctx:
+    # ★★★ UPDATED: Added the guidance for the first reply ★★★
+    # When the user sends "hi", history is [], so turn_count is 0.
+    if s.turn_count == 0:
+        initial_response_guidance = "This is your first reply. You MUST follow the 'First Reply Rule'."
+    elif retrieval_ctx:
         initial_response_guidance = "The user has shared a concern and a relevant scripture was found. Respond with empathy and elaborate gently on how the retrieved verse might apply to their feeling."
     
     if quote_allowed and retrieval_ctx:
@@ -87,7 +94,7 @@ def system_message(s: SessionState, quote_allowed: bool, retrieval_ctx: Optional
     escalation_note = f"Escalation Status: {s.escalate_status}."
     session_status = (
         f"Faith set={s.faith or 'bible_nrsv (Assumed)'}. "
-        f"User Turn={s.turn_count}. "
+        f"User Turn={s.turn_count}. " # This will be 0 for the first message
         f"Quote allowed={quote_allowed and bool(retrieval_ctx)}. "
         f"{escalation_note}"
     )
