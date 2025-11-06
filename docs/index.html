@@ -4,6 +4,11 @@
     <meta charset="utf-8"/>
     <title>Fight Chaplain Chat</title>
     <meta name="viewport" content="width=device-width,initial-scale=1"/>
+    
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;500;600;700&display=swap" rel="stylesheet">
+    
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
         /* Simple scrollbar styling */
@@ -28,11 +33,12 @@
         }
     </style>
     <script>
-        // Set default font to match client's site
         tailwind.config = {
             theme: {
                 extend: {
-                    fontFamily: { sans: ['Inter', 'system-ui', 'Arial', 'sans-serif'] },
+                    fontFamily: { 
+                        sans: ['Montserrat', 'system-ui', 'Arial', 'sans-serif'] 
+                    },
                 }
             }
         }
@@ -53,8 +59,11 @@
     </div>
 
 <script>
-    // ### IMPORTANT: Update this URL to your Render backend ###
-    const API = "https://fight-chaplain.onrender.com"; // <-- PUT YOUR URL HERE
+    // ###############################################################
+    // ★★★  FIX: PUT YOUR REAL RENDER BACKEND URL HERE  ★★★
+    // ###############################################################
+    const API = "https://your-backend-app-name.onrender.com"; 
+    // ###############################################################
 
     const log = document.getElementById("log");
     const msgEl = document.getElementById("msg");
@@ -69,7 +78,7 @@
         const bubble = document.createElement("div");
         bubble.className = "flex justify-end mb-3";
         bubble.innerHTML = `
-            <div class="bg-blue-600 text-white rounded-lg py-2 px-4 max-w-[80%] whitespace-pre-wrap">
+            <div class="bg-blue-600 text-white rounded-lg py-2 px-4 max-w-[80%] whitespace-pre-wrap text-sm">
                 ${text}
             </div>
         `;
@@ -78,14 +87,13 @@
     };
 
     /**
-     * Adds a "Bot" message bubble to the chat log and returns the
-     * span element where text can be streamed.
+     * Adds a "Bot" message bubble to the chat log.
      */
     const addBotMessage = () => {
         const bubble = document.createElement("div");
         bubble.className = "flex justify-start mb-3";
         bubble.innerHTML = `
-            <div class="bg-gray-100 text-gray-800 rounded-lg py-2 px-4 max-w-[80%] whitespace-pre-wrap">
+            <div class="bg-gray-100 text-gray-800 rounded-lg py-2 px-4 max-w-[80%] whitespace-pre-wrap text-sm">
                 <span class="msg-content"></span>
                 <span class="cursor"></span>
             </div>
@@ -119,7 +127,6 @@
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
                 message: text,
-                // Send all history *except* the latest message
                 history: conversationHistory.slice(0, -1) 
             }),
         };
@@ -154,8 +161,6 @@
                         try {
                             const obj = JSON.parse(data);
                             if (obj.text) {
-                                // --- THIS IS THE FIXED STREAM LOGIC ---
-                                // Append the new chunk and update the UI
                                 fullBotResponse += obj.text;
                                 msgSpan.textContent = fullBotResponse;
                                 log.scrollTop = log.scrollHeight;
@@ -192,24 +197,25 @@
         }
     });
 
-    // Add the initial "onboarding" message from the bot
-    const addOnboardingMessage = () => {
-        const bubble = document.createElement("div");
-        bubble.className = "flex justify-start mb-3";
-        bubble.innerHTML = `
-            <div class="bg-gray-100 text-gray-800 rounded-lg py-2 px-4 max-w-[80%] whitespace-pre-wrap">
-                Thank you for logging in! What would you like to talk about?
-            </div>
-        `;
-        log.appendChild(bubble);
-        log.scrollTop = log.scrollHeight;
-    };
-
-    // Show the first message when the page loads
-    addOnboardingMessage();
+    // ★★★ FIX: Removed the addOnboardingMessage() function ★★★
     
     // Ping the backend on load to "wake it up"
-    (async () => { try { await fetch(`${API}/diag`); } catch {} })();
+    (async () => { 
+        try { 
+            const r = await fetch(`${API}/diag`);
+            if (!r.ok) {
+                // If diag fails, show an error in the log
+                const { msgSpan, cursor } = addBotMessage();
+                msgSpan.textContent = "[Error] Backend is not responding. Please check the API URL.";
+                cursor.remove();
+            }
+        } catch (e) {
+            // This will catch the "Failed to fetch" if the URL is wrong
+            const { msgSpan, cursor } = addBotMessage();
+            msgSpan.textContent = `[Error] Failed to fetch. Is the API URL correct?\n${API}`;
+            cursor.remove();
+        }
+    })();
 </script>
 </body>
 </html>
