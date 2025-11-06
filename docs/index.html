@@ -2,220 +2,180 @@
 <html lang="en">
 <head>
     <meta charset="utf-8"/>
-    <title>Fight Chaplain Chat</title>
+    <title>Fight Chaplain LLM Demo</title>
     <meta name="viewport" content="width=device-width,initial-scale=1"/>
-    
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;500;600;700&display=swap" rel="stylesheet">
-    
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
-        /* Simple scrollbar styling */
         #log::-webkit-scrollbar { width: 8px; }
         #log::-webkit-scrollbar-thumb { background-color: #cbd5e1; border-radius: 10px; }
         #log::-webkit-scrollbar-track { background-color: #f1f5f9; }
-        
-        /* The pulsing cursor for the bot */
-        .cursor {
-            width: 10px;
-            height: 1.125rem; /* 18px */
-            background-color: #9ca3af;
-            display: inline-block;
-            vertical-align: middle;
-            margin-left: 2px;
-            border-radius: 2px;
-            animation: pulse 1s infinite;
-        }
-        @keyframes pulse {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0; }
-        }
     </style>
     <script>
         tailwind.config = {
             theme: {
                 extend: {
-                    fontFamily: { 
-                        sans: ['Montserrat', 'system-ui', 'Arial', 'sans-serif'] 
-                    },
+                    fontFamily: { sans: ['Inter', 'system-ui', 'Arial', 'sans-serif'] },
+                    colors: {
+                        'primary-green': '#059669',
+                        'secondary-gray': '#4b5563',
+                        'bg-light': '#f9fafb',
+                    }
                 }
             }
         }
     </script>
 </head>
-<body class="font-sans">
-    
-    <div class="w-full max-w-3xl mx-auto">
-        
-        <div id="log" class="border border-gray-300 bg-white rounded-xl p-4 md:p-5 min-h-80 max-h-[70vh] overflow-y-auto mb-6 shadow-inner">
-            </div>
+<body class="bg-bg-light min-h-screen p-4 sm:p-6 font-sans">
+    <div class="max-w-3xl mx-auto bg-white shadow-xl rounded-2xl p-6 md:p-8">
+        <h2 class="text-3xl font-bold text-gray-800 mb-6 border-b pb-2">Fight Chaplain Demo</h2>
 
-        <div class="flex gap-2 items-end">
-            <textarea id="msg" rows="3" placeholder="Type your message... (e.g., I'm feeling stressed)" class="flex-grow w-full p-3 border border-gray-300 rounded-lg focus:ring-blue-500 focus:border-blue-500 transition duration-150 resize-none text-gray-700"></textarea>
-            
-            <button id="send" class="h-14 w-20 bg-blue-600 text-white font-semibold rounded-lg hover:bg-blue-700 transition duration-150 shadow-lg flex items-center justify-center">Send</button>
+        <div class="flex flex-wrap items-center gap-3 mb-6">
+            <button id="health" class="px-4 py-2 bg-indigo-600 text-white font-medium rounded-lg hover:bg-indigo-700 transition duration-150 shadow-md">Check Backend</button>
+            <label class="text-sm text-secondary-gray flex items-center gap-1">
+                <input type="checkbox" id="stream" checked class="form-checkbox rounded text-primary-green">
+                Stream Response (SSE)
+            </label>
+            <button id="clear" class="px-4 py-2 bg-red-500 text-white font-medium rounded-lg hover:bg-red-600 transition duration-150 shadow-md">Clear Log</button>
+        </div>
+
+        <div id="log" class="border border-gray-300 bg-white rounded-xl p-4 md:p-5 min-h-80 max-h-[60vh] overflow-y-auto mb-6 shadow-inner text-sm">
+            <div class="text-gray-500 italic">Start by clicking 'Check Backend' or sending a message.</div>
+        </div>
+
+        <div class="flex gap-4 items-end">
+            <textarea id="msg" rows="3" placeholder="Type your message... (e.g., I'm feeling stressed. Can you find me a verse from the Bible?)" class="flex-grow w-full p-3 border border-gray-300 rounded-lg focus:ring-primary-green focus:border-primary-green transition duration-150 resize-none text-gray-700"></textarea>
+            <button id="send" class="h-14 w-20 bg-primary-green text-white font-semibold rounded-lg hover:bg-green-700 transition duration-150 shadow-lg flex items-center justify-center">Send</button>
         </div>
     </div>
 
 <script>
-    // ###############################################################
-    // ★★★  FIX: PUT YOUR REAL RENDER BACKEND URL HERE  ★★★
-    // ###############################################################
-    const API = "https://your-backend-app-name.onrender.com"; 
-    // ###############################################################
+    const API = "https://llm-api-demo-5qz1.onrender.com";
 
     const log = document.getElementById("log");
     const msgEl = document.getElementById("msg");
+    const healthBtn = document.getElementById("health");
+    const clearBtn = document.getElementById("clear");
     const sendBtn = document.getElementById("send");
+    const streamBox = document.getElementById("stream");
 
     let conversationHistory = [];
 
-    /**
-     * Adds a "User" message bubble to the chat log.
-     */
-    const addUserMessage = (text) => {
-        const bubble = document.createElement("div");
-        bubble.className = "flex justify-end mb-3";
-        bubble.innerHTML = `
-            <div class="bg-blue-600 text-white rounded-lg py-2 px-4 max-w-[80%] whitespace-pre-wrap text-sm">
-                ${text}
-            </div>
-        `;
-        log.appendChild(bubble);
+    const addLine = (cls, role, text = "") => {
+        const line = document.createElement("div");
+        line.className = `line ${cls} py-1`;
+        const r = document.createElement("span");
+        r.className = `role font-semibold mr-2 ${cls === 'bot' ? 'text-primary-green' : 'text-indigo-600'}`;
+        r.textContent = role + ":";
+        const m = document.createElement("span");
+        m.className = "msg text-gray-800 whitespace-pre-wrap";
+        m.textContent = text;
+        line.appendChild(r);
+        line.appendChild(m);
+        log.appendChild(line);
+        log.scrollTop = log.scrollHeight;
+        return { line, msgSpan: m };
+    };
+
+    const addDbg = (t) => {
+        const d = document.createElement("div");
+        d.className = "line text-xs text-gray-500 italic pt-1 border-t border-gray-100 mt-2";
+        d.textContent = `[Debug] ${t}`;
+        log.appendChild(d);
         log.scrollTop = log.scrollHeight;
     };
 
-    /**
-     * Adds a "Bot" message bubble to the chat log.
-     */
-    const addBotMessage = () => {
-        const bubble = document.createElement("div");
-        bubble.className = "flex justify-start mb-3";
-        bubble.innerHTML = `
-            <div class="bg-gray-100 text-gray-800 rounded-lg py-2 px-4 max-w-[80%] whitespace-pre-wrap text-sm">
-                <span class="msg-content"></span>
-                <span class="cursor"></span>
-            </div>
-        `;
-        log.appendChild(bubble);
-        log.scrollTop = log.scrollHeight;
-        
-        const msgSpan = bubble.querySelector(".msg-content");
-        const cursor = bubble.querySelector(".cursor");
-        
-        return { msgSpan, cursor };
+    healthBtn.onclick = async () => {
+        try {
+            const r = await fetch(`${API}/diag`);
+            const json = await r.json();
+            addDbg(`Backend Status: OK | Model: ${json.openai_model}`);
+        } catch (e) {
+            addDbg(`Backend Error: ${e?.message||e}.`);
+        }
     };
 
-    /**
-     * Handles the Send button click event
-     */
-    const sendMessage = async () => {
+    clearBtn.onclick = () => {
+        log.innerHTML = "";
+        conversationHistory = [];
+    };
+
+    sendBtn.onclick = async () => {
         const text = (msgEl.value || "").trim();
         if (!text) return;
 
-        // 1. Add the user's message to the UI
-        addUserMessage(text);
+        addLine("you", "You", text);
         msgEl.value = "";
         
-        // 2. Add to conversation history
         conversationHistory.push({ role: "user", content: text });
 
-        // 3. Prepare payload for the backend
         const payload = {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
                 message: text,
-                history: conversationHistory.slice(0, -1) 
+                history: conversationHistory.slice(0, -1)
             }),
         };
 
         try {
-            // 4. Create the bot message bubble and get its text span
-            const { msgSpan, cursor } = addBotMessage();
-            let fullBotResponse = "";
-
-            // 5. Call the backend API
             const response = await fetch(`${API}/chat`, payload);
             if (!response.body) throw new Error("Response body is missing.");
             
             const reader = response.body.getReader();
             const decoder = new TextDecoder();
             let buffer = "";
+            let fullBotResponse = "";
 
-            // 6. Read the stream from the backend
-            while (true) {
-                const { done, value } = await reader.read();
-                if (done) break;
+            const { line, msgSpan } = addLine("bot", "Bot", "");
+            const cursor = document.createElement("span");
+            cursor.className = "cursor inline-block w-1.5 h-4 bg-gray-500 align-middle ml-0.5 animate-pulse rounded-sm";
+            line.appendChild(cursor);
 
-                buffer += decoder.decode(value, { stream: true });
-                const lines = buffer.split("\n\n");
-                buffer = lines.pop(); // Keep any partial line for the next loop
+            const streamReader = async () => {
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
 
-                for (const line of lines) {
-                    if (line.startsWith("data: ")) {
-                        const data = line.substring(6).trim();
-                        if (data === "[END]") continue;
-                        
-                        try {
-                            const obj = JSON.parse(data);
-                            if (obj.text) {
-                                fullBotResponse += obj.text;
-                                msgSpan.textContent = fullBotResponse;
-                                log.scrollTop = log.scrollHeight;
-                            }
-                        } catch (e) {
-                            console.error("Failed to parse stream data:", data, e);
+                    buffer += decoder.decode(value, { stream: true });
+                    const lines = buffer.split("\n\n");
+                    buffer = lines.pop();
+
+                    for (const line of lines) {
+                        if (line.startsWith("data: ")) {
+                            const data = line.substring(6).trim();
+                            if (data === "[END]") continue;
+                            try {
+                                const obj = JSON.parse(data);
+                                if (obj.text) {
+                                    for (const char of obj.text) {
+                                        fullBotResponse += char;
+                                        msgSpan.textContent = fullBotResponse;
+                                        await new Promise(resolve => setTimeout(resolve, 0));
+                                    }
+                                }
+                            } catch (e) { /* ignore */ }
                         }
                     }
+                    log.scrollTop = log.scrollHeight;
                 }
-            } // end while
+            };
 
-            // 7. Stream is finished, remove the cursor
+            await streamReader();
+
             cursor.remove();
-            
-            // 8. Add the final, full response to history
             if (fullBotResponse) {
                 conversationHistory.push({ role: "assistant", content: fullBotResponse });
             }
 
         } catch (e) {
-            // Handle network errors
-            const { msgSpan, cursor } = addBotMessage();
-            msgSpan.textContent = "[Error] " + (e?.message || "Could not connect to the server.");
-            cursor.remove();
-            conversationHistory.pop(); // Remove the user message that failed
+            addLine("bot", "Bot", "[Stream Error] " + (e?.message || e));
+            conversationHistory.pop();
         }
     };
-
-    sendBtn.onclick = sendMessage;
-    msgEl.addEventListener("keydown", (e) => {
-        // Send on Ctrl+Enter or Cmd+Enter
-        if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
-            sendMessage();
-        }
-    });
-
-    // ★★★ FIX: Removed the addOnboardingMessage() function ★★★
     
-    // Ping the backend on load to "wake it up"
-    (async () => { 
-        try { 
-            const r = await fetch(`${API}/diag`);
-            if (!r.ok) {
-                // If diag fails, show an error in the log
-                const { msgSpan, cursor } = addBotMessage();
-                msgSpan.textContent = "[Error] Backend is not responding. Please check the API URL.";
-                cursor.remove();
-            }
-        } catch (e) {
-            // This will catch the "Failed to fetch" if the URL is wrong
-            const { msgSpan, cursor } = addBotMessage();
-            msgSpan.textContent = `[Error] Failed to fetch. Is the API URL correct?\n${API}`;
-            cursor.remove();
-        }
-    })();
+    msgEl.addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) sendBtn.onclick(); });
+
+    (async () => { try { await fetch(`${API}/diag`); } catch {} })();
 </script>
 </body>
 </html>
