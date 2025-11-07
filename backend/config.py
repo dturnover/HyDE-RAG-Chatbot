@@ -133,7 +133,7 @@ CRISIS_KEYWORDS_IMMEDIATE = {
     "wanna die",
     "don't want to live anymore",
     "dont want to live anymore",
-V    "don't want to be here anymore",
+    "don't want to be here anymore",
     "dont want to be here anymore",
     "want to end it all",
     "going to end it all"
