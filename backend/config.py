@@ -1,25 +1,33 @@
 # config.py
-#
-# This file is the main configuration and settings hub for the application.
-# This final version moves all critical crisis phrases into the
-# "immediate" list to make the Layer 1 safety check robust.
+"""
+This file acts as the central settings and configuration hub for the entire 
+chatbot application. All API keys, model names, and keyword lists are 
+stored here for easy access and modification.
+"""
 
 import os
 from dotenv import load_dotenv
 
+# Load environment variables from a .env file (if one exists)
 load_dotenv()
 
 # --- API and Model Configuration ---
+# Specifies which AI models we're using for generation and embedding.
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
 
+# A simple check to warn the developer if the API key is missing during startup
 if not OPENAI_API_KEY:
     print("WARNING: OPENAI_API_KEY environment variable not found.")
 
 # --- Faith Mapping ---
+# This dictionary maps user-mentioned keywords to the correct "source"
+# filter in our Pinecone vector database. This is how we know which
+# religious text to search.
 FAITH_KEYWORDS = {
+    # Christian keywords (mapping to two different Bible versions)
     "catholic": "bible_nrsv",
     "christian": "bible_asv",
     "protestant": "bible_asv",
@@ -34,25 +42,38 @@ FAITH_KEYWORDS = {
     "asv": "bible_asv",
     "nrsv": "bible_nrsv",
     "king james": "bible_asv",
+    
+    # Jewish keywords
     "jewish": "tanakh",
     "judaism": "tanakh",
     "hebrew": "tanakh",
     "tanakh": "tanakh",
     "torah": "tanakh",
+    
+    # Muslim keywords
     "muslim": "quran",
     "islam": "quran",
     "quran": "quran",
     "koran": "quran",
+    
+    # Hindu keywords
     "hindu": "gita",
     "gita": "gita",
     "bhagavad gita": "gita",
     "krishna": "gita",
+    
+    # Buddhist keywords
     "buddhist": "dhammapada",
     "buddhism": "dhammapada",
     "dhammapada": "dhammapada",
 }
 
 # --- RAG Trigger Keywords ---
+# These sets determine *if* we should try to search Pinecone.
+
+# DISTRESS_KEYWORDS: Emotional words.
+# If a user's message contains one of these, it triggers our "HyDE"
+# search (logic.py) to find an emotionally relevant passage.
 DISTRESS_KEYWORDS = {
     "afraid", "alone", "anxiety", "anxious", "apprehensive", "dread",
     "fear", "frightened", "freaking out", "nervous", "on edge",
@@ -70,6 +91,10 @@ DISTRESS_KEYWORDS = {
     "shame", "sin", "struggling", "stuck", "suffering", "tempted",
     "terrible", "tired", "trouble", "weak", "worn out"
 }
+
+# ASK_WORDS: Topic-based words.
+# If a user's message contains one of these, it triggers a "normal"
+# RAG search based on the user's message content.
 ASK_WORDS = {
     "advise", "advice",
     "bible",
@@ -86,33 +111,38 @@ ASK_WORDS = {
     "wisdom"
 }
 
-# --- ★★★ UPDATED: Layered Escalation Keywords ★★★ ---
+# --- Layered Escalation Keywords ---
+# These lists are for our 2-layer crisis detection system.
 
 # LAYER 1: IMMEDIATE (Non-AI Check)
-# This list is now much stronger and includes all critical phrases.
-# Our typo-checker's regex will find these phrases anywhere in the user's message.
+# This is our first line of defense. If these words are found (even with 
+# typos), we *immediately* flag the session as 'crisis'.
+#
+# NOTE: "hopeless" was removed from this list. It is still in 
+# DISTRESS_KEYWORDS, which allows the RAG system to find helpful 
+# passages. The "I feel completely hopeless" phrase is still caught 
+# by the Layer 2 semantic check below.
 CRISIS_KEYWORDS_IMMEDIATE = {
     # Single words
     "suicide",
-    "hopeless",
     
     # Key Phrases
     "kill myself",
     "can't go on",
     "want to die",
-    "wanna die", # Added from our failed test
+    "wanna die",
     "don't want to live anymore",
-    "dont want to live anymore", # Added for typos
-    "don't want to be here anymore",
-    "dont want to be here anymore", # Added for typos
+    "dont want to live anymore",
+V    "don't want to be here anymore",
+    "dont want to be here anymore",
     "want to end it all",
     "going to end it all"
 }
 
 # LAYER 2: SEMANTIC (AI Check)
-# This list is now for *subtler* phrases that our keyword
-# list might miss. It's okay if this layer is blocked sometimes,
-# because Layer 1 is now our main safety net.
+# These are more subtle phrases. On startup, we create embeddings for
+# these. We then check if the user's message is semantically similar
+# to any of them. This catches phrases that Layer 1's keywords might miss.
 CRISIS_PHRASES_SEMANTIC = [
     "I am suicidal",
     "My life isn't worth living",
