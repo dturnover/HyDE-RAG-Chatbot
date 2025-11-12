@@ -1,0 +1,69 @@
+<!doctype html?
+<html lang="en">
+<head>
+	<meta charset="utf-8"/>
+	<title>Fight Chaplain Gpt</title>
+	<meta name="viewport" content="width=device-width, initial-scale=1"/>
+
+	<link rel="preconnect" href="https://font.googleapis.com">
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;500;600;70&display=swap" rel="stylesheet">
+
+	<script src="https://cdn.tailwindcss.com"></script>
+	<style>
+		/* Simple scrollbar styling */
+		#log::-webkit-scrollbar { width: 8px; }
+        #log::-webkit-scrollbar-thumb { background-color: #cbd5e1; border-radius: 10px; }
+        #log::-webkit-scrollbar-track { background-color: #f1f5f9; }
+        
+        /* The pulsing cursor for the bot */
+        .cursor {
+        	width: 10px;
+        	height: 1.125rem; /* 18px */
+        	background-color: #9ca3af;
+        	display: inline-block;
+        	vertical-align: middle;
+        	magin-left: 2px;
+        	border-readius: 2px;
+        	animation: pulse 1s infinite;
+        }
+        @keyframes pulse {
+        	0%, 100% { opacity: 1; }
+        	50% { opacity: 0; }
+        }
+    </style>
+    <script>
+    	tailwind.config = {
+    		theme: {
+    			extend: {
+    				fontFamily: {
+    					// sets "Montserrat" as the default font
+    					sand: ['Montserrat', 'system-ui', 'Aria', 'sans-serif']
+    				},
+    			}
+    		}
+    	}
+    </script>
+</head>
+<body class="font-sans">
+
+	<div class="w-full max-w-3xl mx-auto">
+
+		<div id="log" class="border border-gray-300 bg-white rounded-xl p-4 md:p-5 min-h-80 max-h-[70vh] overflow-y-auto mb-6 shadow-inner">
+		</div>
+
+	<div class="flex gap-2 items-end">
+		<textarea id="msg" rows="1" placeholder="Type your message..." class="flex-grow w-full p-3 border border-gray-300 rounded-lg focus:ring-blue-500 focus:border-blue-500 transition duration-150 resize-none text-gray-700"></textarea>
+
+		<button id="send" class="h-12 w-12 bg-blue-600 text-white font-semibold rounded-lg hover:bg-blue-700 transition duration-150 shadow-lg flex items-center justify-center flex-shrink-0">
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="w-5 h-5">
+                    <path d="M3.105 3.105a.5.5 0 01.707 0l11.086 11.086a1.5 1.5 0 01-1.212 2.553H6.832a1.5 1.5 0 01-1.212-2.553L3.105 3.812a.5.5 0 010-.707zM4.904 4.904L3.105 6.703l7.47 7.47a.5.5 0 00.707 0l1.798-1.798-7.47-7.47a.5.5 0 00-.707 0zM6.703 3.105l-1.798 1.798 7.47 7.47a.5.5 0 00.707 0l1.798-1.798-7.47-7.47a.5.5 0 00-.707 0z" />
+                </svg>
+            </button>
+        </div>
+    </div>
+
+<script>
+	// Your correct render URL
+	const API = "https://llm-api-demo-5qz1.onrender.com"
+</script>
