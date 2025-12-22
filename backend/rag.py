@@ -107,7 +107,6 @@ def pinecone_search(query_embedding, faith_filter, top_k=5):
         query_results = index.query(
             vector=query_embedding,
             filter={"source": faith_filter},
-            # ★★★ FIX: Corrected 'tok_k' to 'top_k'
             top_k=top_k,
             include_metadata=True   # this is critical to get the text and ref
         )
@@ -150,7 +149,6 @@ def clean_verse(text):
     # removed [1], [2], etc
     text = re.sub(r'\[\d+\]', '', text)
     # removes ellipses
-    # ★★★ FIX: Cleaned up spacing for readability
     text = text.replace("...", "").replace("..", ".")
     # replaces multiple spaces, newlines, tabs with a single space
     text = re.sub(r'\s+', ' ', text).strip()
@@ -211,7 +209,6 @@ def find_relevant_scripture(transformed_query, faith_context):
         if not query_embedding:
             logging.error(f"Failed to get embedding for query: '{transformed_query}', aborting search.")
             return None, None 
-    # ★★★ FIX: Un-indented 'except' block to align with 'try'
     except Exception as e:
         logging.error(f"An unexpected error occurred during get_embedding: {e}", exc_info=True)
         return None, None 
@@ -253,7 +250,6 @@ def find_relevant_scripture(transformed_query, faith_context):
             cleaned_text = clean_verse(text)
             # quality check: ensure the verse isn't jsut a tiny fragment
             if len(cleaned_text.split()) >= 5:
-                # ★★★ FIX: Correctly appended a tuple
                 valid_candidates.append((cleaned_text, ref))
 
     # 5e. if we have valid, high-score candidates, pick one at random
