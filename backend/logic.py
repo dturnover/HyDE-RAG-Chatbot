@@ -67,7 +67,6 @@ To do this, you MUST follow this process:
 4.  Ask for Faith (Gently): If you don't know my faith and the moment feels right, you can gently ask if I (the user) am guided by a particular faith
 """
 
-# ★★★ FIX: Added 'quote_allowed' back to the function signature
 def system_message(s: SessionState, quote_allowed: bool, retrieval_ctx: Optional[str]) -> Dict[str, str]:
     # builds the final "system message" (AI's instructions) based on the current session state
 
@@ -248,7 +247,6 @@ def wants_retrieval(msg):
 
     match = check_for_keywords(msg, all_trigger_keywords)
 
-    # ★★★ FIX: Removed duplicate line
     # if we found any match return True
     return match is not None
 
