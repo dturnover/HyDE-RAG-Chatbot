@@ -108,7 +108,7 @@ def pinecone_search(query_embedding, faith_filter, top_k=5):
             vector=query_embedding,
             filter={"source": faith_filter},
             top_k=top_k,
-            include_metadata=True   # this is critical to get the text and ref
+            include_metadata=True   
         )
 
         # format the raw pinecone results into a simple list of dictionaries
@@ -153,35 +153,6 @@ def clean_verse(text):
     # replaces multiple spaces, newlines, tabs with a single space
     text = re.sub(r'\s+', ' ', text).strip()
     return text
-
-
-
-def get_cosine_similarity(v1, v2):
-    # calculates the similarite from -1 to 1 between two embeddings
-
-    try:
-        # convert lists to numpy arrays for efficient math
-        v1_np = np.array(v1)
-        v2_np = np.array(v2)
-
-        # calculate the dot product
-        dot_product = np.dot(v1_np, v2_np)
-
-        # calculates the magnitudes (norms) of the vector
-        # ★★★ FIX: Corrected 'linag' to 'linalg'
-        norm_v1 = np.linalg.norm(v1_np)
-        norm_v2 = np.linalg.norm(v2_np)
-
-        # avoid division by zero
-        if norm_v1 == 0 or norm_v2 == 0:
-            return 0.0
-
-        # the cosine similarity formula
-        return dot_product / (norm_v1 * norm_v2) 
-
-    except Exception as e:
-        logging.error(f"Error calculating cosine similarity: {e}", exc_info=True)
-        return 0.0
 
 
 
