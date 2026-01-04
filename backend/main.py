@@ -67,7 +67,6 @@ async def chat_handler(request: Request):
         raise HTTPException(status_code=400, detail="Invalid JSON payload.")
 
     # --- core chatbot logic ---
-    # It was incorrectly inside the 'except' block above.
     # 1. create a new blank "SessionState" object for this specific request
     s = logic.SessionState(history=history)
 
