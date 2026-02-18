@@ -18,6 +18,12 @@ import logic
 app = FastAPI(title="Fight Chaplain Backend")
 
 
+MAX_HISTORY_MESSAGES = 20
+MAX_HISTORY_MSG_CHARS = 1200
+MAX_USER_MSG_CHARS = 2000
+MAX_MODEL_TOKENS = 350
+
+
 @app.on_event("startup")
 async def on_startup():
     # this function runs once and only once on startup
@@ -57,8 +63,17 @@ async def chat_handler(request: Request):
 
     try:
         data = await request.json()
-        msg = data.get("message", "").strip()
-        history = data.get("history", [])
+
+        msg = (data.get("message") or "").strip()[:MAX_USER_MSG_CHARS]
+        
+        history = data.get("history") or []
+        if not isinstance(history, list):
+            history = []
+        history = history[-MAX_HISTORY_MESSAGES:]
+
+        for t in history:
+            if isinstance(t, dict) and isinstance(t.get("content"), str):
+                t["content"] = t["content"][:MAX_HISTORY_MSG_CHARS]
 
         # basic validation
         if not msg:
@@ -112,7 +127,8 @@ async def chat_handler(request: Request):
                 model=config.OPENAI_MODEL,
                 messages=messages_for_llm,
                 stream=True,
-                temperature=0.25 # low temperature for more focused answers
+                temperature=0.25
+                max_tokens=MAX_MODEL_TOKENS
             )
 
             # send each chunk of text as it arrives
